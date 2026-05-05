@@ -5,6 +5,10 @@ import numpy as np
 from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitialize
 from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
 
+import open3d as o3d
+
+# source ../../../../go2/bin/activate
+
 # ROS sensor_msgs/PointField.datatype  ->  numpy dtype
 _PF_TO_NP = {
     1: np.int8,   2: np.uint8,
@@ -90,3 +94,12 @@ if __name__ == "__main__":
     print(f"n puntos  : {len(xyz)}")
     print(f"primer    : {xyz[0]}")
     print(f"bbox      : min={xyz.min(axis=0)}  max={xyz.max(axis=0)}")
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    pcd.paint_uniform_color([0.6, 0.7, 1.0])
+
+    ejes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
+    o3d.visualization.draw_geometries([pcd, ejes])
+
+    o3d.io.write_point_cloud("go2_scan.pcd", pcd)
