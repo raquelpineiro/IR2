@@ -114,7 +114,7 @@ def get_yaw_from_rot(R):
 
 
 def _pivot_to_face(target_x, target_y, client, odom,
-                   yaw_tolerance=math.radians(3.0)):
+                   yaw_tolerance=math.radians(5.0)):
     """
     Fase 1: pivota en el sitio (vx=0) hasta encarar el punto objetivo
     dentro de `yaw_tolerance` (3° por defecto).
@@ -285,6 +285,24 @@ def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
     print(f"[SQUARE] Cuadrado de {side_len:.2f} m de lado, "
           f"{stops_per_side} paradas/lado, paso {step:.2f} m "
           f"({'horario' if clockwise else 'antihorario'})")
+
+    # Asegurar que el robot está en un gait de marcha. Sin esto, Move(0,0,vyaw)
+    # con vx=0 puede no rotar (BalanceStand mantiene las patas plantadas).
+    print("[SQUARE] BalanceStand + ClassicWalk")
+    client.BalanceStand()
+    time.sleep(0.6)
+    client.ClassicWalk(True)
+    time.sleep(0.4)
+
+    # Precalentar gait: las primeras décimas de segundo desde reposo no
+    # producen desplazamiento porque las patas están entrando en cadencia.
+    # Enviar Move(0,0,0) durante ~1.2 s las pone "trotando en sitio" para
+    # que el primer waypoint arranque ya con el gait en régimen.
+    print("[SQUARE] Precalentando gait (1.2 s)...")
+    warmup_end = time.time() + 1.2
+    while time.time() < warmup_end:
+        client.Move(0.0, 0.0, 0.0)
+        time.sleep(0.05)
 
     for idx, (rx, ry) in enumerate(waypoints_rel, start=1):
         wx, wy = _robot_to_world(rx, ry, x0, y0, yaw0)
