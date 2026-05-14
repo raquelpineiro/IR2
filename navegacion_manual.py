@@ -113,45 +113,73 @@ def get_yaw_from_rot(R):
     return math.atan2(R[1, 0], R[0, 0])
 
 
-def _pivot_to_face(target_x, target_y, client, odom,
-                   yaw_tolerance=math.radians(5.0)):
+def _wrap_pi(a):
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def _apply_vyaw_deadband(vyaw, yaw_error, yaw_tolerance, min_useful=0.5):
     """
-    Fase 1: pivota en el sitio (vx=0) hasta encarar el punto objetivo
-    dentro de `yaw_tolerance` (3° por defecto).
+    El Go2 ignora vyaw muy pequeños (banda muerta del firmware/gait).
+    Si pedimos un vyaw insuficiente pero seguimos fuera de tolerancia,
+    forzar un mínimo útil que sí mueva las patas.
+    """
+    if abs(yaw_error) > yaw_tolerance and abs(vyaw) < min_useful:
+        return math.copysign(min_useful, yaw_error)
+    return vyaw
+
+
+def _pivot_to_heading(target_yaw_world, client, odom,
+                      yaw_tolerance=math.radians(5.0), tag="pivot"):
+    """
+    Pivota en el sitio hasta encarar un yaw absoluto del mundo, sin importar
+    posición. Útil en esquinas: garantiza 90° aunque la odometría tenga
+    deriva en XY.
     """
     Kp_w = 1.5
     max_w = 0.8
     last_log = 0.0
 
     while True:
-        curr_x = odom.t[0]
-        curr_y = odom.t[1]
         curr_yaw = get_yaw_from_rot(odom.R)
-
-        dx = target_x - curr_x
-        dy = target_y - curr_y
-
-        # Si ya estamos casi encima, no tiene sentido pivotar
-        if math.hypot(dx, dy) < 1e-3:
-            return
-
-        target_yaw = math.atan2(dy, dx)
-        yaw_error = math.atan2(math.sin(target_yaw - curr_yaw),
-                               math.cos(target_yaw - curr_yaw))
+        yaw_error = _wrap_pi(target_yaw_world - curr_yaw)
 
         if abs(yaw_error) < yaw_tolerance:
             return
 
         vyaw = max(-max_w, min(max_w, Kp_w * yaw_error))
+        vyaw = _apply_vyaw_deadband(vyaw, yaw_error, yaw_tolerance)
         client.Move(0.0, 0.0, vyaw)
 
         now = time.time()
         if now - last_log > 0.5:
-            print(f"  [pivot] yaw_err={math.degrees(yaw_error):+6.1f}°  "
+            print(f"  [{tag}] yaw_obj={math.degrees(target_yaw_world):+6.1f}°  "
+                  f"yaw_now={math.degrees(curr_yaw):+6.1f}°  "
+                  f"err={math.degrees(yaw_error):+6.1f}°  "
                   f"vyaw={vyaw:+.2f}")
             last_log = now
 
         time.sleep(0.05)
+
+
+def _pivot_to_face(target_x, target_y, client, odom,
+                   yaw_tolerance=math.radians(5.0)):
+    """
+    Pivota en el sitio hasta encarar (target_x, target_y).
+    Útil para correcciones finas; en esquinas usa _pivot_to_heading.
+    """
+    while True:
+        curr_x = odom.t[0]
+        curr_y = odom.t[1]
+        dx = target_x - curr_x
+        dy = target_y - curr_y
+
+        if math.hypot(dx, dy) < 1e-3:
+            return
+
+        target_yaw = math.atan2(dy, dx)
+        _pivot_to_heading(target_yaw, client, odom,
+                          yaw_tolerance=yaw_tolerance, tag="pivot")
+        return
 
 
 def _walk_to(target_x, target_y, client, odom, tolerance=0.1):
@@ -266,21 +294,23 @@ def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
     x0, y0, yaw0 = _initial_frame(odom)
     side_len = step * stops_per_side
 
-    # Dirección de cada lado en el frame inicial del robot (vector unitario)
+    # Dirección y heading ABSOLUTO (en el mundo) de cada lado.
+    # El ángulo es relativo a yaw0 -> al sumar yaw0 obtenemos el yaw del mundo
+    # que el robot debe mantener mientras camina ese lado.
     if clockwise:
-        sides = [(1, 0), (0, -1), (-1, 0), (0, 1)]   # delante, derecha, atrás, izquierda
+        sides = [
+            ((1, 0),  0.0),                 # delante
+            ((0, -1), -math.pi / 2),        # derecha
+            ((-1, 0), math.pi),             # atrás
+            ((0, 1),  math.pi / 2),         # izquierda
+        ]
     else:
-        sides = [(1, 0), (0, 1), (-1, 0), (0, -1)]   # delante, izquierda, atrás, derecha
-
-    # Construir lista de waypoints en frame inicial, partiendo del origen del robot
-    waypoints_rel = []
-    base_x, base_y = 0.0, 0.0
-    for dir_x, dir_y in sides:
-        for i in range(1, stops_per_side + 1):
-            waypoints_rel.append((base_x + dir_x * step * i,
-                                  base_y + dir_y * step * i))
-        base_x += dir_x * side_len
-        base_y += dir_y * side_len
+        sides = [
+            ((1, 0),  0.0),                 # delante
+            ((0, 1),  math.pi / 2),         # izquierda
+            ((-1, 0), math.pi),             # atrás
+            ((0, -1), -math.pi / 2),        # derecha
+        ]
 
     print(f"[SQUARE] Cuadrado de {side_len:.2f} m de lado, "
           f"{stops_per_side} paradas/lado, paso {step:.2f} m "
@@ -296,25 +326,48 @@ def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
 
     # Precalentar gait: las primeras décimas de segundo desde reposo no
     # producen desplazamiento porque las patas están entrando en cadencia.
-    # Enviar Move(0,0,0) durante ~1.2 s las pone "trotando en sitio" para
-    # que el primer waypoint arranque ya con el gait en régimen.
     print("[SQUARE] Precalentando gait (1.2 s)...")
     warmup_end = time.time() + 1.2
     while time.time() < warmup_end:
         client.Move(0.0, 0.0, 0.0)
         time.sleep(0.05)
 
-    for idx, (rx, ry) in enumerate(waypoints_rel, start=1):
-        wx, wy = _robot_to_world(rx, ry, x0, y0, yaw0)
-        print(f"[SQUARE] {idx:2d}/{len(waypoints_rel)} "
-              f"rel=({rx:+.2f},{ry:+.2f}) -> mundo=({wx:+.2f},{wy:+.2f})")
-        _go_to_world_xy(wx, wy, client, odom, tolerance=tolerance)
+    base_x, base_y = 0.0, 0.0
+    total_wp = stops_per_side * 4
+    wp_idx = 0
 
-        # Pausa "viva": mantener gait activo sin desplazarse
-        pause_end = time.time() + pause_s
+    for side_num, ((dir_x, dir_y), angle_rel) in enumerate(sides, start=1):
+        # Pivote a HEADING ABSOLUTO del lado (en el mundo), ignorando deriva en XY
+        target_heading = _wrap_pi(yaw0 + angle_rel)
+        print(f"[SQUARE] Lado {side_num}/4 -> heading mundo "
+              f"{math.degrees(target_heading):+6.1f}°")
+        _pivot_to_heading(target_heading, client, odom, tag="corner")
+
+        # Pausa breve tras la esquina para estabilizar
+        pause_end = time.time() + 0.4
         while time.time() < pause_end:
             client.Move(0.0, 0.0, 0.0)
             time.sleep(0.05)
+
+        # Caminar a cada waypoint del lado SIN volver a pivotar entre ellos
+        for i in range(1, stops_per_side + 1):
+            wp_idx += 1
+            rx = base_x + dir_x * step * i
+            ry = base_y + dir_y * step * i
+            wx, wy = _robot_to_world(rx, ry, x0, y0, yaw0)
+            print(f"[SQUARE] {wp_idx:2d}/{total_wp} "
+                  f"rel=({rx:+.2f},{ry:+.2f}) -> mundo=({wx:+.2f},{wy:+.2f})")
+
+            _walk_to(wx, wy, client, odom, tolerance=tolerance)
+
+            # Pausa entre paradas dentro del mismo lado
+            pause_end = time.time() + pause_s
+            while time.time() < pause_end:
+                client.Move(0.0, 0.0, 0.0)
+                time.sleep(0.05)
+
+        base_x += dir_x * side_len
+        base_y += dir_y * side_len
 
     client.StopMove()
     print("[SQUARE] Cuadrado completado")
