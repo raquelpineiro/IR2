@@ -113,54 +113,109 @@ def get_yaw_from_rot(R):
     return math.atan2(R[1, 0], R[0, 0])
 
 
-def _go_to_world_xy(target_x, target_y, client, odom, tolerance=0.1):
+def _pivot_to_face(target_x, target_y, client, odom,
+                   yaw_tolerance=math.radians(3.0)):
     """
-    Bucle de control interno: navega a (target_x, target_y) en coordenadas
-    del MUNDO (las que publica rt/utlidar/robot_pose).
+    Fase 1: pivota en el sitio (vx=0) hasta encarar el punto objetivo
+    dentro de `yaw_tolerance` (3° por defecto).
     """
-    Kp_v = 0.6  # Ganancia proporcional para la velocidad lineal (aceleración)
-    Kp_w = 1.2  # Ganancia proporcional para la velocidad de giro
-    max_v = 0.4 # m/s máximo por seguridad
-    max_w = 0.8 # rad/s máximo por seguridad
+    Kp_w = 1.5
+    max_w = 0.8
+    last_log = 0.0
 
     while True:
-        # 1. Obtener la posición actual
         curr_x = odom.t[0]
         curr_y = odom.t[1]
         curr_yaw = get_yaw_from_rot(odom.R)
 
-        # 2. Calcular los errores (diferencia espacial)
+        dx = target_x - curr_x
+        dy = target_y - curr_y
+
+        # Si ya estamos casi encima, no tiene sentido pivotar
+        if math.hypot(dx, dy) < 1e-3:
+            return
+
+        target_yaw = math.atan2(dy, dx)
+        yaw_error = math.atan2(math.sin(target_yaw - curr_yaw),
+                               math.cos(target_yaw - curr_yaw))
+
+        if abs(yaw_error) < yaw_tolerance:
+            return
+
+        vyaw = max(-max_w, min(max_w, Kp_w * yaw_error))
+        client.Move(0.0, 0.0, vyaw)
+
+        now = time.time()
+        if now - last_log > 0.5:
+            print(f"  [pivot] yaw_err={math.degrees(yaw_error):+6.1f}°  "
+                  f"vyaw={vyaw:+.2f}")
+            last_log = now
+
+        time.sleep(0.05)
+
+
+def _walk_to(target_x, target_y, client, odom, tolerance=0.1):
+    """
+    Fase 2: avanza hacia (target_x, target_y) con correcciones suaves
+    de yaw para mantener el rumbo. Si el error de yaw crece más allá del
+    umbral, vuelve a pivotar y reintenta.
+    """
+    Kp_v = 0.6
+    Kp_w = 1.0
+    max_v = 0.4
+    max_w = 0.4                       # más suave: solo correcciones finas
+    yaw_redo_threshold = math.radians(20.0)
+
+    last_log = 0.0
+
+    while True:
+        curr_x = odom.t[0]
+        curr_y = odom.t[1]
+        curr_yaw = get_yaw_from_rot(odom.R)
+
         dx = target_x - curr_x
         dy = target_y - curr_y
         distance = math.hypot(dx, dy)
 
-        # 3. Condición de parada (¡Hemos llegado!)
         if distance < tolerance:
             print(f"[NAV] ¡Destino ({target_x:+.2f}, {target_y:+.2f}) alcanzado!")
-            client.StopMove()
             return
 
-        # 4. Calcular hacia dónde tenemos que mirar
         target_yaw = math.atan2(dy, dx)
+        yaw_error = math.atan2(math.sin(target_yaw - curr_yaw),
+                               math.cos(target_yaw - curr_yaw))
 
-        # Calcular cuánto tenemos que girar (normalizando el ángulo entre -pi y pi)
-        yaw_error = target_yaw - curr_yaw
-        yaw_error = math.atan2(math.sin(yaw_error), math.cos(yaw_error))
+        # Si la desviación crece demasiado, re-pivotar antes de seguir
+        if abs(yaw_error) > yaw_redo_threshold:
+            return _pivot_then_walk(target_x, target_y, client, odom, tolerance)
 
-        # 5. Calcular velocidades
-        vyaw = Kp_w * yaw_error
-        vyaw = max(-max_w, min(max_w, vyaw))
-
-        vx = Kp_v * distance * math.cos(yaw_error)
-        vx = max(-max_v, min(max_v, vx))
-
-        if abs(yaw_error) > math.radians(40):
-            vx = 0.0
-
-        # 6. Enviar comando al perro
+        vx = max(-max_v, min(max_v, Kp_v * distance))
+        vyaw = max(-max_w, min(max_w, Kp_w * yaw_error))
         client.Move(vx, 0.0, vyaw)
 
+        now = time.time()
+        if now - last_log > 0.5:
+            print(f"  [walk]  dist={distance:.3f} m  "
+                  f"yaw_err={math.degrees(yaw_error):+6.1f}°  "
+                  f"vx={vx:+.2f}  vyaw={vyaw:+.2f}")
+            last_log = now
+
         time.sleep(0.05)
+
+
+def _pivot_then_walk(target_x, target_y, client, odom, tolerance):
+    _pivot_to_face(target_x, target_y, client, odom)
+    _walk_to(target_x, target_y, client, odom, tolerance=tolerance)
+
+
+def _go_to_world_xy(target_x, target_y, client, odom, tolerance=0.1):
+    """
+    Bucle de control: pivota en el sitio para encarar y después
+    camina recto. Si el robot se desvía durante la marcha, vuelve a
+    pivotar.
+    """
+    _pivot_to_face(target_x, target_y, client, odom)
+    _walk_to(target_x, target_y, client, odom, tolerance=tolerance)
 
 
 def _wait_for_pose(odom):
@@ -236,8 +291,14 @@ def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
         print(f"[SQUARE] {idx:2d}/{len(waypoints_rel)} "
               f"rel=({rx:+.2f},{ry:+.2f}) -> mundo=({wx:+.2f},{wy:+.2f})")
         _go_to_world_xy(wx, wy, client, odom, tolerance=tolerance)
-        time.sleep(pause_s)
 
+        # Pausa "viva": mantener gait activo sin desplazarse
+        pause_end = time.time() + pause_s
+        while time.time() < pause_end:
+            client.Move(0.0, 0.0, 0.0)
+            time.sleep(0.05)
+
+    client.StopMove()
     print("[SQUARE] Cuadrado completado")
 
 
@@ -256,12 +317,12 @@ def main():
     client.Init()
 
     # Cuadrado: 4 paradas por lado (incluida la esquina) cada 0.65 m
-    # -> lado = 2.60 m, sentido antihorario (delante, izquierda, atrás, derecha)
+    # -> lado = 2.60 m, sentido horario (delante, derecha, atrás, izquierda)
     nav_thread = threading.Thread(
         target=do_square,
         kwargs=dict(client=client, odom=odom,
                     step=0.65, stops_per_side=4, pause_s=1.0,
-                    clockwise=False),
+                    clockwise=True),
         daemon=True
     )
     nav_thread.start()
