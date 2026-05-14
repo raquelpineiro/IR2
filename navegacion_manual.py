@@ -113,32 +113,15 @@ def get_yaw_from_rot(R):
     return math.atan2(R[1, 0], R[0, 0])
 
 
-def go_to_waypoint(target_x_rel, target_y_rel, client, odom, tolerance=0.1):
+def _go_to_world_xy(target_x, target_y, client, odom, tolerance=0.1):
     """
-    Navega hacia una coordenada (X, Y) expresada en el frame del robot
-    en el instante de arranque: +X hacia delante, +Y hacia la izquierda.
-    tolerance: A cuántos metros del objetivo consideramos que hemos llegado (ej. 0.1 = 10 cm).
+    Bucle de control interno: navega a (target_x, target_y) en coordenadas
+    del MUNDO (las que publica rt/utlidar/robot_pose).
     """
     Kp_v = 0.6  # Ganancia proporcional para la velocidad lineal (aceleración)
     Kp_w = 1.2  # Ganancia proporcional para la velocidad de giro
     max_v = 0.4 # m/s máximo por seguridad
     max_w = 0.8 # rad/s máximo por seguridad
-
-    # Esperar a tener la primera pose para fijar el frame de referencia inicial
-    while not odom.has_pose:
-        time.sleep(0.05)
-
-    x0 = odom.t[0]
-    y0 = odom.t[1]
-    yaw0 = get_yaw_from_rot(odom.R)
-    c0, s0 = math.cos(yaw0), math.sin(yaw0)
-
-    # Pasar el objetivo del frame inicial del robot al frame del mundo
-    target_x = x0 + c0 * target_x_rel - s0 * target_y_rel
-    target_y = y0 + s0 * target_x_rel + c0 * target_y_rel
-
-    print(f"[THREAD] Objetivo relativo ({target_x_rel:+.2f}, {target_y_rel:+.2f}) "
-          f"-> mundo ({target_x:+.2f}, {target_y:+.2f})")
 
     while True:
         # 1. Obtener la posición actual
@@ -153,31 +136,109 @@ def go_to_waypoint(target_x_rel, target_y_rel, client, odom, tolerance=0.1):
 
         # 3. Condición de parada (¡Hemos llegado!)
         if distance < tolerance:
-            print(f"[THREAD] ¡Destino ({target_x}, {target_y}) alcanzado!")
+            print(f"[NAV] ¡Destino ({target_x:+.2f}, {target_y:+.2f}) alcanzado!")
             client.StopMove()
-            break
+            return
 
         # 4. Calcular hacia dónde tenemos que mirar
         target_yaw = math.atan2(dy, dx)
-        
+
         # Calcular cuánto tenemos que girar (normalizando el ángulo entre -pi y pi)
         yaw_error = target_yaw - curr_yaw
         yaw_error = math.atan2(math.sin(yaw_error), math.cos(yaw_error))
 
         # 5. Calcular velocidades
         vyaw = Kp_w * yaw_error
-        vyaw = max(-max_w, min(max_w, vyaw)) 
+        vyaw = max(-max_w, min(max_w, vyaw))
 
         vx = Kp_v * distance * math.cos(yaw_error)
-        vx = max(-max_v, min(max_v, vx))     
+        vx = max(-max_v, min(max_v, vx))
 
         if abs(yaw_error) > math.radians(40):
             vx = 0.0
 
         # 6. Enviar comando al perro
         client.Move(vx, 0.0, vyaw)
-        
+
         time.sleep(0.05)
+
+
+def _wait_for_pose(odom):
+    while not odom.has_pose:
+        time.sleep(0.05)
+
+
+def _initial_frame(odom):
+    """Captura el frame inicial del robot a partir de la odometría."""
+    x0 = odom.t[0]
+    y0 = odom.t[1]
+    yaw0 = get_yaw_from_rot(odom.R)
+    return x0, y0, yaw0
+
+
+def _robot_to_world(rx, ry, x0, y0, yaw0):
+    """Transforma (rx, ry) del frame del robot inicial al frame del mundo."""
+    c0, s0 = math.cos(yaw0), math.sin(yaw0)
+    return x0 + c0 * rx - s0 * ry, y0 + s0 * rx + c0 * ry
+
+
+def go_to_waypoint(target_x_rel, target_y_rel, client, odom, tolerance=0.1):
+    """
+    Navega hacia una coordenada (X, Y) expresada en el frame del robot
+    en el instante de arranque: +X hacia delante, +Y hacia la izquierda.
+    """
+    _wait_for_pose(odom)
+    x0, y0, yaw0 = _initial_frame(odom)
+    target_x, target_y = _robot_to_world(target_x_rel, target_y_rel, x0, y0, yaw0)
+
+    print(f"[THREAD] Objetivo relativo ({target_x_rel:+.2f}, {target_y_rel:+.2f}) "
+          f"-> mundo ({target_x:+.2f}, {target_y:+.2f})")
+
+    _go_to_world_xy(target_x, target_y, client, odom, tolerance=tolerance)
+
+
+def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
+              clockwise=False, tolerance=0.1):
+    """
+    Recorre un cuadrado en el plano del suelo deteniéndose cada `step` metros.
+    Cada lado tiene `stops_per_side` paradas (incluyendo la esquina final),
+    así que la longitud de un lado es `step * stops_per_side`.
+
+    Por defecto: 5 paradas/lado x 0.65 m = 3.25 m por lado, sentido antihorario
+    (delante → izquierda → atrás → derecha).
+    """
+    _wait_for_pose(odom)
+    x0, y0, yaw0 = _initial_frame(odom)
+    side_len = step * stops_per_side
+
+    # Dirección de cada lado en el frame inicial del robot (vector unitario)
+    if clockwise:
+        sides = [(1, 0), (0, -1), (-1, 0), (0, 1)]   # delante, derecha, atrás, izquierda
+    else:
+        sides = [(1, 0), (0, 1), (-1, 0), (0, -1)]   # delante, izquierda, atrás, derecha
+
+    # Construir lista de waypoints en frame inicial, partiendo del origen del robot
+    waypoints_rel = []
+    base_x, base_y = 0.0, 0.0
+    for dir_x, dir_y in sides:
+        for i in range(1, stops_per_side + 1):
+            waypoints_rel.append((base_x + dir_x * step * i,
+                                  base_y + dir_y * step * i))
+        base_x += dir_x * side_len
+        base_y += dir_y * side_len
+
+    print(f"[SQUARE] Cuadrado de {side_len:.2f} m de lado, "
+          f"{stops_per_side} paradas/lado, paso {step:.2f} m "
+          f"({'horario' if clockwise else 'antihorario'})")
+
+    for idx, (rx, ry) in enumerate(waypoints_rel, start=1):
+        wx, wy = _robot_to_world(rx, ry, x0, y0, yaw0)
+        print(f"[SQUARE] {idx:2d}/{len(waypoints_rel)} "
+              f"rel=({rx:+.2f},{ry:+.2f}) -> mundo=({wx:+.2f},{wy:+.2f})")
+        _go_to_world_xy(wx, wy, client, odom, tolerance=tolerance)
+        time.sleep(pause_s)
+
+    print("[SQUARE] Cuadrado completado")
 
 
 def main():
@@ -194,14 +255,13 @@ def main():
     client.SetTimeout(5.0)
     client.Init()
 
-    # Coordenadas de destino relativas al robot al arrancar:
-    # +X = delante, +Y = izquierda
-    destino_x_rel = 2.0
-    destino_y_rel = 1.0
-
+    # Cuadrado: 4 paradas por lado (incluida la esquina) cada 0.65 m
+    # -> lado = 2.60 m, sentido antihorario (delante, izquierda, atrás, derecha)
     nav_thread = threading.Thread(
-        target=go_to_waypoint,
-        args=(destino_x_rel, destino_y_rel, client, odom),
+        target=do_square,
+        kwargs=dict(client=client, odom=odom,
+                    step=0.65, stops_per_side=4, pause_s=1.0,
+                    clockwise=False),
         daemon=True
     )
     nav_thread.start()
