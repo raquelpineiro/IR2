@@ -113,9 +113,10 @@ def get_yaw_from_rot(R):
     return math.atan2(R[1, 0], R[0, 0])
 
 
-def go_to_waypoint(target_x, target_y, client, odom, tolerance=0.1):
+def go_to_waypoint(target_x_rel, target_y_rel, client, odom, tolerance=0.1):
     """
-    Navega hacia una coordenada X, Y.
+    Navega hacia una coordenada (X, Y) expresada en el frame del robot
+    en el instante de arranque: +X hacia delante, +Y hacia la izquierda.
     tolerance: A cuántos metros del objetivo consideramos que hemos llegado (ej. 0.1 = 10 cm).
     """
     Kp_v = 0.6  # Ganancia proporcional para la velocidad lineal (aceleración)
@@ -123,14 +124,23 @@ def go_to_waypoint(target_x, target_y, client, odom, tolerance=0.1):
     max_v = 0.4 # m/s máximo por seguridad
     max_w = 0.8 # rad/s máximo por seguridad
 
-    print(f"[THREAD] Iniciando viaje hacia ({target_x}, {target_y})...")
+    # Esperar a tener la primera pose para fijar el frame de referencia inicial
+    while not odom.has_pose:
+        time.sleep(0.05)
+
+    x0 = odom.t[0]
+    y0 = odom.t[1]
+    yaw0 = get_yaw_from_rot(odom.R)
+    c0, s0 = math.cos(yaw0), math.sin(yaw0)
+
+    # Pasar el objetivo del frame inicial del robot al frame del mundo
+    target_x = x0 + c0 * target_x_rel - s0 * target_y_rel
+    target_y = y0 + s0 * target_x_rel + c0 * target_y_rel
+
+    print(f"[THREAD] Objetivo relativo ({target_x_rel:+.2f}, {target_y_rel:+.2f}) "
+          f"-> mundo ({target_x:+.2f}, {target_y:+.2f})")
 
     while True:
-        # Asegurarnos de que tenemos datos de odometría
-        if not odom.has_pose:
-            time.sleep(0.05)
-            continue
-
         # 1. Obtener la posición actual
         curr_x = odom.t[0]
         curr_y = odom.t[1]
@@ -184,14 +194,15 @@ def main():
     client.SetTimeout(5.0)
     client.Init()
 
-    # Define aquí las coordenadas de destino (relativas al punto de inicio)
-    destino_x = 2.0 
-    destino_y = 1.0
+    # Coordenadas de destino relativas al robot al arrancar:
+    # +X = delante, +Y = izquierda
+    destino_x_rel = 2.0
+    destino_y_rel = 1.0
 
     nav_thread = threading.Thread(
-        target=go_to_waypoint, 
-        args=(destino_x, destino_y, client, odom), 
-        daemon=True 
+        target=go_to_waypoint,
+        args=(destino_x_rel, destino_y_rel, client, odom),
+        daemon=True
     )
     nav_thread.start()
     # ---------------------------------------------------------------
