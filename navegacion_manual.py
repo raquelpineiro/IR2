@@ -18,8 +18,9 @@ TOPIC_POSE = "rt/utlidar/robot_pose"
 VOXEL_SIZE = 0.04            # 4 cm — algo más fino para suavizar mejor
 DOWNSAMPLE_EVERY = 10        # ~1 s a 10 Hz: agrupa el coste del post-procesado
 MAX_POINTS = 2_000_000
-Z_RANGE = (-1.5, 4.5)
+Z_RANGE = (-1.5, 4.5) # solo esta detectando los puntos a ciertas alturas
 
+# constantes para filtrado de puntos
 OUTLIER_NB = 20
 OUTLIER_STD = 2.0
 NORMAL_RADIUS = 0.20
@@ -28,7 +29,7 @@ NORMAL_MAX_NN = 30
 TRAJ_MIN_STEP = 0.03         # 3 cm: paso mínimo para añadir vértice de trayectoria
 
 
-# Aproximación viridis (5 puntos de control)
+# Aproximación viridis (5 puntos de control) (es para colores)
 _VIRIDIS = np.array([
     [0.00, 0.267, 0.005, 0.329],
     [0.25, 0.130, 0.330, 0.550],
@@ -177,8 +178,7 @@ def _pivot_to_face(target_x, target_y, client, odom,
             return
 
         target_yaw = math.atan2(dy, dx)
-        _pivot_to_heading(target_yaw, client, odom,
-                          yaw_tolerance=yaw_tolerance, tag="pivot")
+        _pivot_to_heading(target_yaw, client, odom, yaw_tolerance=yaw_tolerance, tag="pivot")
         return
 
 
@@ -280,8 +280,7 @@ def go_to_waypoint(target_x_rel, target_y_rel, client, odom, tolerance=0.1):
     _go_to_world_xy(target_x, target_y, client, odom, tolerance=tolerance)
 
 
-def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
-              clockwise=False, tolerance=0.1):
+def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0, clockwise=False, tolerance=0.1):
     """
     Recorre un cuadrado en el plano del suelo deteniéndose cada `step` metros.
     Cada lado tiene `stops_per_side` paradas (incluyendo la esquina final),
@@ -299,10 +298,10 @@ def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
     # que el robot debe mantener mientras camina ese lado.
     if clockwise:
         sides = [
-            ((1, 0),  0.0),                 # delante
-            ((0, -1), -math.pi / 2),        # derecha
-            ((-1, 0), math.pi),             # atrás
-            ((0, 1),  math.pi / 2),         # izquierda
+            ((1, 0),  0.0, (-20, +20)),                 # delante
+            ((0, -1), -math.pi / 2, (-20, -20)),        # derecha
+            ((-1, 0), math.pi, (+20, -20)),             # atrás
+            ((0, 1),  math.pi / 2, (+20, +20)),         # izquierda
         ]
     else:
         sides = [
@@ -336,7 +335,7 @@ def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
     total_wp = stops_per_side * 4
     wp_idx = 0
 
-    for side_num, ((dir_x, dir_y), angle_rel) in enumerate(sides, start=1):
+    for side_num, ((dir_x, dir_y), angle_rel, (rec_x, rec_y)) in enumerate(sides, start=1):
         # Pivote a HEADING ABSOLUTO del lado (en el mundo), ignorando deriva en XY
         target_heading = _wrap_pi(yaw0 + angle_rel)
         print(f"[SQUARE] Lado {side_num}/4 -> heading mundo "
@@ -366,8 +365,8 @@ def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
                 client.Move(0.0, 0.0, 0.0)
                 time.sleep(0.05)
 
-        base_x += dir_x * side_len
-        base_y += dir_y * side_len
+        base_x += dir_x * side_len + rec_x
+        base_y += dir_y * side_len + rec_y
 
     client.StopMove()
     print("[SQUARE] Cuadrado completado")
@@ -391,9 +390,7 @@ def main():
     # -> lado = 2.60 m, sentido horario (delante, derecha, atrás, izquierda)
     nav_thread = threading.Thread(
         target=do_square,
-        kwargs=dict(client=client, odom=odom,
-                    step=0.65, stops_per_side=4, pause_s=1.0,
-                    clockwise=True),
+        kwargs=dict(client=client, odom=odom, step=0.60, stops_per_side=3, pause_s=1.0, clockwise=True),
         daemon=True
     )
     nav_thread.start()
