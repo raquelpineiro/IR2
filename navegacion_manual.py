@@ -167,9 +167,7 @@ def _pivot_to_heading(target_yaw_world, client, odom,
 
 
 def _pivot_to_heading_precise(target_yaw_world, client, odom, tag="corner",
-                              tolerances=(math.radians(5.0),
-                                          math.radians(2.0),
-                                          math.radians(1.0)),
+                              tolerances=(math.radians(5.0), math.radians(2.0), math.radians(1.0)),
                               settle_s=0.4):
     """
     Pivote iterativo con tolerancia decreciente:
@@ -261,6 +259,7 @@ def _walk_to(target_x, target_y, client, odom, tolerance=0.1):
 
         # Si la desviación crece demasiado, re-pivotar antes de seguir
         if abs(yaw_error) > yaw_redo_threshold:
+            print(f"ESTOY ENTRANDO")
             return _pivot_then_walk(target_x, target_y, client, odom, tolerance)
 
         vx = max(-max_v, min(max_v, Kp_v * distance))
@@ -301,6 +300,7 @@ def _initial_frame(odom):
     """Captura el frame inicial del robot a partir de la odometría."""
     x0 = odom.t[0]
     y0 = odom.t[1]
+    print(f"HEIGHT AT THE BEGINNING: {odom.t[2]}")
     yaw0 = get_yaw_from_rot(odom.R)
     return x0, y0, yaw0
 
@@ -337,12 +337,12 @@ class OccupancyGrid:
     """
 
     def __init__(self, step, stops_per_side, clockwise, x0, y0, yaw0,
-                 z_min=-0.10, z_max=0.50, hit_threshold=5):
+                 z_min=0.25, z_max=0.5, hit_threshold=5):
         self.step = step
-        self.n = stops_per_side
-        self.side_len = step * stops_per_side
-        self.x_range = (0.0, self.side_len)
-        self.y_range = (-self.side_len, 0.0) if clockwise else (0.0, self.side_len)
+        self.n = stops_per_side + 1
+        self.side_len = step * (stops_per_side + 1)
+        self.x_range = (0.0, self.side_len / (stops_per_side + 1))
+        self.y_range = (-self.side_len / (stops_per_side + 1), 0.0) if clockwise else (0.0, self.side_len / (stops_per_side + 1))
         self.x0, self.y0, self.yaw0 = x0, y0, yaw0
         self.z_min, self.z_max = z_min, z_max
         self.hit_threshold = hit_threshold
@@ -420,7 +420,7 @@ class OccupancyGrid:
 
 
 def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
-              clockwise=False, tolerance=0.1, lidar=None, hit_threshold=5):
+              clockwise=False, tolerance=0.15, lidar=None, hit_threshold=5):
     """
     Recorre un cuadrado en el plano del suelo deteniéndose cada `step` metros.
     Cada lado tiene `stops_per_side` paradas (incluyendo la esquina final),
@@ -436,6 +436,9 @@ def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
     _wait_for_pose(odom)
     x0, y0, yaw0 = _initial_frame(odom)
     side_len = step * stops_per_side
+
+    print(f"STARTING YAW IN THE FOLLOWING FORMAT: {yaw0}")
+    print(f"YAW TO DEGREES: {math.degrees(yaw0)}")
 
     grid = None
     if lidar is not None:
@@ -482,16 +485,28 @@ def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
         client.Move(0.0, 0.0, 0.0)
         time.sleep(0.05)
 
+
     base_x, base_y = 0.0, 0.0
     total_wp = stops_per_side * 4
     wp_idx = 0
 
     for side_num, ((dir_x, dir_y), angle_rel) in enumerate(sides, start=1):
+        if side_num == 1:
+            base_x, base_y = 0.0, 0.0
+        elif side_num == 2:
+            base_x, base_y = 1.60, -0.2
+        elif side_num == 3:
+            base_x, base_y = 1.40, -1.8
+        elif side_num == 4:
+            base_x, base_y = -0.20, -1.6
         # Pivote a HEADING ABSOLUTO del lado (en el mundo), ignorando deriva en XY
         target_heading = _wrap_pi(yaw0 + angle_rel)
         print(f"[SQUARE] Lado {side_num}/4 -> heading mundo "
               f"{math.degrees(target_heading):+6.1f}°")
+        
+        # print(f"CURRENT ODOMETRY: {odom.t.copy()}")
         _pivot_to_heading_precise(target_heading, client, odom, tag="corner")
+        # print(f"RESULTING ODOMETRY: {odom.t.copy()}")
 
         # Pausa breve tras la esquina para estabilizar
         pause_end = time.time() + 0.4
@@ -520,9 +535,8 @@ def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
             if grid is not None:
                 hits = grid.capture(lidar, odom)
                 print(f"  [GRID] parada {wp_idx}/{total_wp}: {hits} hits dentro del cuadrado")
-
-        base_x += dir_x * side_len
-        base_y += dir_y * side_len
+        #base_x += dir_x * side_len
+        #base_y += dir_y * side_len
 
     client.StopMove()
     print("[SQUARE] Cuadrado completado")
@@ -552,7 +566,7 @@ def main():
     nav_thread = threading.Thread(
         target=do_square,
         kwargs=dict(client=client, odom=odom, lidar=custom,
-                    step=0.65, stops_per_side=4, pause_s=1.0,
+                    step=0.60, stops_per_side=3, pause_s=1.0,
                     clockwise=True),
         daemon=True
     )
