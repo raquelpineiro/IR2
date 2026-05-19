@@ -1,0 +1,9 @@
+Opción 1
+- Crear mapa de baldosas (6X6), tamaño de 50X50. Avance de casilla en casiña
+- Primera etapa: avanza aleatoriamente y detecta si la casilla está ocupada o no (asimismo que solo hay objetos en los bordes)
+- Segunda etapa: ir de la casilla a a la casilla b y detectar si en esa casilla hay un objeto o no
+
+Asumir siempre inicio en la (0,0)
+
+Opción 2
+- Dar el mapa directamente y comprobar si hay diferencias

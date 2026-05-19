@@ -134,6 +134,10 @@ def _pivot_to_heading(target_yaw_world, client, odom,
     Pivota en el sitio hasta encarar un yaw absoluto del mundo, sin importar
     posición. Útil en esquinas: garantiza 90° aunque la odometría tenga
     deriva en XY.
+
+    Al cruzar la tolerancia manda explícitamente Move(0,0,0) para cortar la
+    rotación residual del gait — sin esto, el robot sigue girando 50-200 ms
+    a la última vyaw comandada (= overshoot importante con la banda muerta).
     """
     Kp_w = 1.5
     max_w = 0.8
@@ -144,6 +148,7 @@ def _pivot_to_heading(target_yaw_world, client, odom,
         yaw_error = _wrap_pi(target_yaw_world - curr_yaw)
 
         if abs(yaw_error) < yaw_tolerance:
+            client.Move(0.0, 0.0, 0.0)
             return
 
         vyaw = max(-max_w, min(max_w, Kp_w * yaw_error))
@@ -159,6 +164,47 @@ def _pivot_to_heading(target_yaw_world, client, odom,
             last_log = now
 
         time.sleep(0.05)
+
+
+def _pivot_to_heading_precise(target_yaw_world, client, odom, tag="corner",
+                              tolerances=(math.radians(5.0),
+                                          math.radians(2.0),
+                                          math.radians(1.0)),
+                              settle_s=0.4):
+    """
+    Pivote iterativo con tolerancia decreciente:
+
+      1. Pivota a tol gruesa (5°) — corrige el grueso del giro.
+      2. Manda Move(0,0,0) durante `settle_s` para que el gait se asiente.
+      3. Re-mide yaw. Si sigue fuera de la próxima tol (2°), repite.
+      4. Idem para 1°.
+
+    Mata el overshoot del deadband: lo que el primer pivote pasa de largo,
+    los siguientes lo recortan con menos velocidad (más fino el control P).
+    """
+    for i, tol in enumerate(tolerances):
+        curr_yaw = get_yaw_from_rot(odom.R)
+        err = _wrap_pi(target_yaw_world - curr_yaw)
+
+        if abs(err) < tol:
+            # Ya estamos dentro de esta tolerancia; saltamos al siguiente nivel
+            continue
+
+        print(f"  [{tag}] paso {i + 1}/{len(tolerances)}  "
+              f"tol={math.degrees(tol):.1f}°  err_inicial={math.degrees(err):+5.2f}°")
+
+        _pivot_to_heading(target_yaw_world, client, odom,
+                          yaw_tolerance=tol, tag=f"{tag}#{i + 1}")
+
+        settle_end = time.time() + settle_s
+        while time.time() < settle_end:
+            client.Move(0.0, 0.0, 0.0)
+            time.sleep(0.05)
+
+    curr_yaw = get_yaw_from_rot(odom.R)
+    err = _wrap_pi(target_yaw_world - curr_yaw)
+    print(f"  [{tag}] final  obj={math.degrees(target_yaw_world):+6.1f}°  "
+          f"yaw={math.degrees(curr_yaw):+6.1f}°  err={math.degrees(err):+5.2f}°")
 
 
 def _pivot_to_face(target_x, target_y, client, odom,
@@ -280,8 +326,101 @@ def go_to_waypoint(target_x_rel, target_y_rel, client, odom, tolerance=0.1):
     _go_to_world_xy(target_x, target_y, client, odom, tolerance=tolerance)
 
 
+class OccupancyGrid:
+    """
+    Rejilla N x N binaria de ocupación (N = stops_per_side), en el frame
+    relativo al inicio del cuadrado. Cada celda mide `step` x `step` metros.
+
+    Convención: +X = delante, +Y = izquierda.
+      - antihorario: cuadrado en rx ∈ [0, L], ry ∈ [0, L]
+      - horario:     cuadrado en rx ∈ [0, L], ry ∈ [-L, 0]
+    """
+
+    def __init__(self, step, stops_per_side, clockwise, x0, y0, yaw0,
+                 z_min=-0.10, z_max=0.50, hit_threshold=5):
+        self.step = step
+        self.n = stops_per_side
+        self.side_len = step * stops_per_side
+        self.x_range = (0.0, self.side_len)
+        self.y_range = (-self.side_len, 0.0) if clockwise else (0.0, self.side_len)
+        self.x0, self.y0, self.yaw0 = x0, y0, yaw0
+        self.z_min, self.z_max = z_min, z_max
+        self.hit_threshold = hit_threshold
+        self.counts = np.zeros((self.n, self.n), dtype=np.int64)
+        self.n_captures = 0
+        self._lock = threading.Lock()
+
+    def capture(self, lidar, odom):
+        data = lidar.get_cloud()
+        if data is None or len(data["xyz"]) == 0:
+            return 0
+
+        xyz_lidar = data["xyz"].astype(np.float64, copy=False)
+        xyz_world = xyz_lidar @ odom.R.T + odom.t
+
+        # mundo -> frame inicial del cuadrado
+        c, s = math.cos(-self.yaw0), math.sin(-self.yaw0)
+        dx = xyz_world[:, 0] - self.x0
+        dy = xyz_world[:, 1] - self.y0
+        rx = c * dx - s * dy
+        ry = s * dx + c * dy
+        rz = xyz_world[:, 2]
+
+        mask = (
+            (rz > self.z_min) & (rz < self.z_max)
+            & (rx >= self.x_range[0]) & (rx < self.x_range[1])
+            & (ry >= self.y_range[0]) & (ry < self.y_range[1])
+        )
+
+        with self._lock:
+            self.n_captures += 1
+            if not mask.any():
+                return 0
+            hist, _, _ = np.histogram2d(
+                rx[mask], ry[mask],
+                bins=[self.n, self.n],
+                range=[list(self.x_range), list(self.y_range)],
+            )
+            self.counts += hist.astype(np.int64)
+            return int(mask.sum())
+
+    def binary(self):
+        with self._lock:
+            return self.counts >= self.hit_threshold
+
+    def print_map(self):
+        binmap = self.binary()
+        with self._lock:
+            counts = self.counts.copy()
+            ncap = self.n_captures
+
+        print(f"\n[GRID] Mapa {self.n}x{self.n}  "
+              f"(celda {self.step:.2f} m, hits>={self.hit_threshold}, "
+              f"capturas={ncap})    +X=arriba   +Y=izquierda")
+        for ix in reversed(range(self.n)):
+            chars = ["#" if binmap[ix, iy] else "." for iy in reversed(range(self.n))]
+            print("    " + "  ".join(chars))
+
+        print("\n[GRID] Hits por celda:")
+        for ix in reversed(range(self.n)):
+            row = [f"{counts[ix, iy]:5d}" for iy in reversed(range(self.n))]
+            print("    " + " ".join(row))
+
+    def save(self, path):
+        with self._lock:
+            np.savez(
+                path,
+                counts=self.counts,
+                binary=(self.counts >= self.hit_threshold).astype(np.uint8),
+                step=self.step,
+                stops_per_side=self.n,
+                x_range=np.array(self.x_range),
+                y_range=np.array(self.y_range),
+            )
+
+
 def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
-              clockwise=False, tolerance=0.1):
+              clockwise=False, tolerance=0.1, lidar=None, hit_threshold=5):
     """
     Recorre un cuadrado en el plano del suelo deteniéndose cada `step` metros.
     Cada lado tiene `stops_per_side` paradas (incluyendo la esquina final),
@@ -289,10 +428,21 @@ def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
 
     Por defecto: 5 paradas/lado x 0.65 m = 3.25 m por lado, sentido antihorario
     (delante → izquierda → atrás → derecha).
+
+    Si se pasa `lidar`, en cada parada se acumula un escaneo en una rejilla
+    binaria de ocupación N x N (N = stops_per_side) que se imprime y se
+    guarda como `mapa_ocupacion.npz` al terminar.
     """
     _wait_for_pose(odom)
     x0, y0, yaw0 = _initial_frame(odom)
     side_len = step * stops_per_side
+
+    grid = None
+    if lidar is not None:
+        grid = OccupancyGrid(
+            step=step, stops_per_side=stops_per_side, clockwise=clockwise,
+            x0=x0, y0=y0, yaw0=yaw0, hit_threshold=hit_threshold,
+        )
 
     # Dirección y heading ABSOLUTO (en el mundo) de cada lado.
     # El ángulo es relativo a yaw0 -> al sumar yaw0 obtenemos el yaw del mundo
@@ -341,7 +491,7 @@ def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
         target_heading = _wrap_pi(yaw0 + angle_rel)
         print(f"[SQUARE] Lado {side_num}/4 -> heading mundo "
               f"{math.degrees(target_heading):+6.1f}°")
-        _pivot_to_heading(target_heading, client, odom, tag="corner")
+        _pivot_to_heading_precise(target_heading, client, odom, tag="corner")
 
         # Pausa breve tras la esquina para estabilizar
         pause_end = time.time() + 0.4
@@ -366,11 +516,21 @@ def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
                 client.Move(0.0, 0.0, 0.0)
                 time.sleep(0.05)
 
+            # Captura para el mapa de ocupación (robot detenido)
+            if grid is not None:
+                hits = grid.capture(lidar, odom)
+                print(f"  [GRID] parada {wp_idx}/{total_wp}: {hits} hits dentro del cuadrado")
+
         base_x += dir_x * side_len
         base_y += dir_y * side_len
 
     client.StopMove()
     print("[SQUARE] Cuadrado completado")
+
+    if grid is not None:
+        grid.print_map()
+        grid.save("mapa_ocupacion")
+        print("[GRID] guardado en mapa_ocupacion.npz")
 
 
 def main():
@@ -391,7 +551,7 @@ def main():
     # -> lado = 2.60 m, sentido horario (delante, derecha, atrás, izquierda)
     nav_thread = threading.Thread(
         target=do_square,
-        kwargs=dict(client=client, odom=odom,
+        kwargs=dict(client=client, odom=odom, lidar=custom,
                     step=0.65, stops_per_side=4, pause_s=1.0,
                     clockwise=True),
         daemon=True
