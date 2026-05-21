@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "go2_lidar"
+version = "0.1.0"
+description = "Utilidades de LiDAR, mapeo y navegación para el Unitree Go2"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "Abanca Robotics", email = "rpineirop@abanca.com" },
+]
+license = { text = "Proprietary" }
+keywords = ["unitree", "go2", "lidar", "robotics"]
+
+dependencies = [
+    "numpy>=1.20",
+    "open3d>=0.16",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["go2_lidar*"]
