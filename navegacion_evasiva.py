@@ -11,7 +11,7 @@ from obtencion_nube_puntos import Custom
 TOPIC_CLOUD = "rt/utlidar/cloud_deskewed"
 
 # Geometría / banda de altura del cuerpo (frame del LiDAR, z=0 ~ altura del LiDAR)
-ROBOT_Z_MIN = -0.10          # ignora suelo y patas
+ROBOT_Z_MIN = 0          # ignora suelo y patas
 ROBOT_Z_MAX = 0.50           # ignora techo
 
 # Zona de búsqueda en planta (XY)
@@ -21,8 +21,8 @@ FOV_DEG = 160.0              # arco frontal usado para decidir
 N_SECTORS = 9                # bines angulares dentro del FOV
 
 # Distancias críticas
-STOP_DIST = 0.55             # m: por debajo, parar y reorientarse
-SLOW_DIST = 1.30             # m: por debajo, frenar linealmente
+STOP_DIST = 2             # m: por debajo, parar y reorientarse
+SLOW_DIST = 1.5             # m: por debajo, frenar linealmente
 
 # Velocidades (conservador)
 V_MAX = 0.30                 # m/s lineal
@@ -70,7 +70,7 @@ def decide_command(distances, centers):
     central = distances[max(0, front - 1): front + 2]
     front_min = central.min()
 
-    if front_min < STOP_DIST:
+    if front_min > STOP_DIST:
         best = int(np.argmax(distances))
         if distances[best] > SLOW_DIST:
             target = centers[best]

@@ -7,6 +7,7 @@ from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitial
 from unitree_sdk2py.idl.geometry_msgs.msg.dds_ import PoseStamped_
 
 from obtencion_nube_puntos import Custom
+from go2_lidar.transforms import _robot_to_world, _wrap_pi
 
 
 TOPIC_CLOUD = "rt/utlidar/cloud_deskewed"
@@ -16,6 +17,8 @@ VOXEL_SIZE = 0.04            # 4 cm — algo más fino para suavizar mejor
 DOWNSAMPLE_EVERY = 10        # ~1 s a 10 Hz: agrupa el coste del post-procesado
 MAX_POINTS = 2_000_000
 Z_RANGE = (-1.5, 4.5)
+X_RANGE = -1
+Y_RANGE = -1
 
 OUTLIER_NB = 20
 OUTLIER_STD = 2.0
@@ -61,7 +64,7 @@ class OdomTracker:
         p = msg.pose.position
         q = msg.pose.orientation
         self.t = np.array([p.x, p.y, p.z], dtype=np.float64)
-        self.R = quat_to_rot(q.x, q.y, q.z, q.w)
+        #self.R = quat_to_rot(q.x, q.y, q.z, q.w)
         self.has_pose = True
         return True
 
@@ -113,7 +116,9 @@ def main():
 
     custom = Custom(TOPIC_CLOUD)
     odom = OdomTracker()
-
+    """x0, y0, yaw0 = odom._initial_frame()
+    target_dir = _wrap_pi(yaw0)
+    wx, wy = _robot_to_world(0.0, 60.0, x0, y0, yaw0)"""
     vis = o3d.visualization.VisualizerWithKeyCallback()
     vis.create_window(window_name="Go2 LiDAR (mapa)", width=1280, height=720)
 
@@ -197,10 +202,16 @@ def main():
             if data is not None and len(data["xyz"]) > 0 and odom.has_pose:
                 xyz_lidar = data["xyz"].astype(np.float64, copy=False)
                 xyz_world = xyz_lidar @ odom.R.T + odom.t
+                #mask = (xyz_world[:,0] > 0) #& (xyz_lidar[:,1] > Y_RANGE)
+                #xyz_world = xyz_world[mask]
+
+                #xyz_world = xyz_world[xyz_world[:,1]>Y_RANGE]
+                #xyz_world = xyz_world[xyz_world[:,0]>X_RANGE]
                 colors = colorize_by_z(xyz_world)
 
                 frame_pcd = o3d.geometry.PointCloud()
                 frame_pcd.points = o3d.utility.Vector3dVector(xyz_world)
+    
                 frame_pcd.colors = o3d.utility.Vector3dVector(colors)
                 s.accumulated += frame_pcd
                 s.frames_since_voxel += 1
