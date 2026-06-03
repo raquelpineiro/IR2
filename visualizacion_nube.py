@@ -197,10 +197,20 @@ def main():
             if data is not None and len(data["xyz"]) > 0 and odom.has_pose:
                 xyz_lidar = data["xyz"].astype(np.float64, copy=False)
                 xyz_world = xyz_lidar @ odom.R.T + odom.t
-                colors = colorize_by_z(xyz_world)
+                colors = colorize_by_z(xyz_lidar)
 
                 frame_pcd = o3d.geometry.PointCloud()
-                frame_pcd.points = o3d.utility.Vector3dVector(xyz_world)
+
+                x_lidar, y_lidar, z_lidar = xyz_lidar[:, 0], xyz_lidar[:,1], xyz_lidar[:, 2]
+                x_range = (0, 5)
+                y_range = (-5, 0)
+                z_min = 0.1
+                z_max = 0.8
+                mask = (
+                    (z_lidar > z_min) & (z_lidar < z_max)
+                    & (x_lidar >= x_range[0] + odom.t[0]) & (x_lidar < x_range[1] + odom.t[0]) & (y_lidar >= y_range[0] + odom.t[1]) & 
+                    (y_lidar < y_range[1] + odom.t[1]))
+                frame_pcd.points = o3d.utility.Vector3dVector(xyz_lidar[mask])
                 frame_pcd.colors = o3d.utility.Vector3dVector(colors)
                 s.accumulated += frame_pcd
                 s.frames_since_voxel += 1
