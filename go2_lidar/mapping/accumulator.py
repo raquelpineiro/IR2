@@ -25,6 +25,8 @@ _VIRIDIS = np.array([
     [1.00, 0.992, 0.906, 0.144],
 ])
 
+# [0.850, 0.150, 0.100]
+
 
 def colorize_by_z(xyz, z_min=Z_RANGE[0], z_max=Z_RANGE[1]):
     z = xyz[:, 2].astype(np.float32, copy=False)
@@ -55,7 +57,6 @@ class State:
         self.traj_points = []
         self.prev_robot_T = np.eye(4)
 
-
 def visualizator_start(odom, custom):    
 
     vis = o3d.visualization.VisualizerWithKeyCallback()
@@ -85,6 +86,7 @@ def visualizator_start(odom, custom):
 
     def toggle_traj(_v):
         s.show_trajectory = not s.show_trajectory
+        #print(f"La trayectoria es: {trajectory.points[0]}, {trajectory.points[1]}")
         (vis.add_geometry if s.show_trajectory else vis.remove_geometry)(trajectory, reset_bounding_box=False)
         return False
 
@@ -112,9 +114,11 @@ def visualizator_start(odom, custom):
     vis.register_key_callback(ord("S"), save_map)
 
     print("[teclas]  P: puntos   T: trayectoria   C: limpiar mapa   S: guardar")
+    started = False
 
     try:
-        while True:
+        while custom.end == False:
+        #while True:
             pose_changed = odom.update()
 
             if pose_changed:
@@ -128,6 +132,7 @@ def visualizator_start(odom, custom):
                 if len(s.traj_points) == 0 or np.linalg.norm(pos - s.traj_points[-1]) > TRAJ_MIN_STEP:
                     s.traj_points.append(pos)
                     if len(s.traj_points) >= 2:
+                        started = True
                         pts = np.asarray(s.traj_points)
                         n = len(pts)
                         lines = np.column_stack([np.arange(n - 1), np.arange(1, n)])
@@ -138,15 +143,21 @@ def visualizator_start(odom, custom):
                         vis.update_geometry(trajectory)
 
             data = custom.get_cloud()
-            if data is not None and len(data["xyz"]) > 0 and odom.has_pose:
+            if data is not None and len(data["xyz"]) > 0 and odom.has_pose and started:
                 xyz_lidar = data["xyz"].astype(np.float64, copy=False)
-                xyz_world = xyz_lidar @ odom.R.T + odom.t
-                colors = colorize_by_z(xyz_world)
-
+                colors = colorize_by_z(xyz_lidar)
+                
                 frame_pcd = o3d.geometry.PointCloud()
-                frame_pcd.points = o3d.utility.Vector3dVector(xyz_world)
+                frame_pcd.points = o3d.utility.Vector3dVector(xyz_lidar)
                 frame_pcd.colors = o3d.utility.Vector3dVector(colors)
                 s.accumulated += frame_pcd
+
+                if custom.occupancy is not None:
+                    frame_obstacle = o3d.geometry.PointCloud()
+                    frame_obstacle.points = o3d.utility.Vector3dVector(custom.occupancy)
+                    obs_color = np.tile([0.850, 0.150, 0.100], (len(custom.occupancy), 1))
+                    frame_obstacle.colors = o3d.utility.Vector3dVector(obs_color)
+                    s.accumulated += frame_obstacle
                 s.frames_since_voxel += 1
 
                 if s.frames_since_voxel >= DOWNSAMPLE_EVERY or len(s.accumulated.points) > MAX_POINTS:
@@ -172,5 +183,35 @@ def visualizator_start(odom, custom):
 
             if data is None:
                 time.sleep(0.01)
+
+
     finally:
-        vis.destroy_window()
+        from rpd import rpd
+        try:
+            pts = np.asarray(trajectory.points)
+            min_x = pts[int(np.argmin(pts[:,0]))][0]
+            max_x = pts[int(np.argmax(pts[:,0]))][0]
+            min_y = pts[int(np.argmin(pts[:,1]))][1]
+            max_y = pts[int(np.argmax(pts[:,1]))][1]
+            
+            
+            while custom.end:
+                new_points = np.asarray(s.accumulated.points)
+                xyz_rob = (new_points) @ odom.R #- odom.t
+                x_lidar, y_lidar, z_lidar = xyz_rob[:, 0], xyz_rob[:,1], xyz_rob[:, 2]
+                #x_lidar, y_lidar, z_lidar = new_points[:, 0], new_points[:,1], new_points[:, 2]
+
+                mask = ((x_lidar >= min_x) & (x_lidar < max_x) & (y_lidar >= min_y) & 
+                (y_lidar < max_y))
+                
+                new_points = new_points[mask]
+                s.pcd.points = o3d.utility.Vector3dVector(new_points)
+                s.pcd.colors = o3d.utility.Vector3dVector(colorize_by_z(new_points))
+                #print(s.pcd)
+                vis.update_geometry(s.pcd)
+                if not vis.poll_events():
+                    break
+                vis.update_renderer()
+                
+        finally:
+            vis.destroy_window()
