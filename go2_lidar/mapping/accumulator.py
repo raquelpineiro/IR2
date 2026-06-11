@@ -1,6 +1,8 @@
 import open3d as o3d
 import numpy as np
 import time
+import cv2
+import matplotlib.path as mpath
 
 OUTLIER_NB = 20
 OUTLIER_STD = 2.0
@@ -46,6 +48,63 @@ def post_process(pcd, robot_pos):
     cleaned.orient_normals_towards_camera_location(robot_pos)
     return cleaned
 
+
+def square_subdivision(vertices, n_lado):
+    n_lado = n_lado + 1
+    v = np.array(vertices, dtype=float)
+    v0, v1, v2, v3 = v[0], v[1], v[2], v[3]
+    s = np.linspace(0, 1, n_lado + 1)
+    t = np.linspace(0, 1, n_lado + 1)
+    S, T = np.meshgrid(s, t)
+    top = v0[None, None, :]*(1-S)[..., None] + v1[None, None, :]*(S)[..., None]
+    bottom = v3[None, None, :]*(1-S)[..., None] + v2[None, None, :]*(S)[..., None]
+    grid = top*(1-T)[..., None] + bottom * T[..., None]
+    return grid
+
+def grid_lineset(grid, z=0.0, color=(1.0, 0.3, 0.3)):
+    nrows, ncols, _ = grid.shape
+    pts3 = np.dstack([grid, np.full((nrows, ncols), z)]).reshape(-1, 3)
+
+    def idx(r, c):
+        return r * ncols + c
+    
+    lines = []
+    for r in range(nrows):
+        for c in range(ncols):
+            if c + 1 < ncols:
+                lines.append([idx(r, c), idx(r, c+1)])
+            if r + 1 < nrows:
+                lines.append([idx(r, c), idx(r+1, c)])
+
+
+    ls = o3d.geometry.LineSet(o3d.utility.Vector3dVector(pts3), o3d.utility.Vector2iVector(np.asarray(lines)),)
+    ls.colors = o3d.utility.Vector3dVector(np.tile(color, (len(lines), 1)))
+    return ls
+
+def constructCellMap(pts, vertices, n_div, z_min = 0.15, z_max=0.8):
+    v = np.asarray(vertices, dtype=float)
+    v0, v1, v3 = v[0], v[1], v[3]
+    e_s = v1 - v0
+    e_t = v3 - v0
+
+    z = pts[:,2]
+    mask_z = (z>=z_min) & (z <= z_max)
+    p = pts[mask_z, :2] - v0
+    
+    M = np.column_stack([e_s, e_t])
+    st = p @ np.linalg.inv(M).T
+    s_coord, t_coord = st[:,0], st[:,1]
+
+    dentro = (s_coord >= 0) & (s_coord < 1) & (t_coord >= 0) & (t_coord < 1)
+    s_coord, t_coord = s_coord[dentro], t_coord[dentro]
+
+    ci = np.floor(s_coord * n_div).astype(int)
+    cj = np.floor(t_coord * n_div).astype(int)
+
+    occupancy = np.zeros((n_div, n_div), dtype=int)
+    np.add.at(occupancy, (cj, ci), 1)
+    return occupancy
+
 class State:
     def __init__(self):
         self.accumulated = o3d.geometry.PointCloud()
@@ -56,7 +115,6 @@ class State:
         self.frames_since_voxel = 0
         self.traj_points = []
         self.prev_robot_T = np.eye(4)
-
 
 def visualizator_start(odom, custom):    
 
@@ -118,8 +176,8 @@ def visualizator_start(odom, custom):
     started = False
 
     try:
-        #while custom.end == False:
-        while True:
+        while custom.end == False:
+        #while True:
             pose_changed = odom.update()
 
             if pose_changed:
@@ -134,8 +192,6 @@ def visualizator_start(odom, custom):
                     s.traj_points.append(pos)
                     if len(s.traj_points) >= 2:
                         started = True
-                        ini_point = s.traj_points[-2]
-                        end_point = s.traj_points[-1]
                         pts = np.asarray(s.traj_points)
                         n = len(pts)
                         lines = np.column_stack([np.arange(n - 1), np.arange(1, n)])
@@ -148,21 +204,12 @@ def visualizator_start(odom, custom):
             data = custom.get_cloud()
             if data is not None and len(data["xyz"]) > 0 and odom.has_pose and started:
                 xyz_lidar = data["xyz"].astype(np.float64, copy=False)
-                """mask = (end_point[0]-ini_point[0])*(xyz_lidar[:,1] - ini_point[1]) - (end_point[1]-ini_point[1]) *(xyz_lidar[:,0] - ini_point[0])
-                mask_izq = mask > 0
-                xyz_lidar = xyz_lidar[mask_izq]"""
                 colors = colorize_by_z(xyz_lidar)
-
+                
                 frame_pcd = o3d.geometry.PointCloud()
                 frame_pcd.points = o3d.utility.Vector3dVector(xyz_lidar)
                 frame_pcd.colors = o3d.utility.Vector3dVector(colors)
                 s.accumulated += frame_pcd
-
-                if custom.occupancy != None:
-                    frame_obstacle = o3d.geometry.PointCloud()
-                    frame_obstacle.points = o3d.utility.Vector3dVector(custom.occupancy)
-                    frame_obstacle.colors = o3d.utility.Vector3dVector(np.array(0.850, 0.150, 0.100))
-                    s.accumulated += frame_obstacle
                 s.frames_since_voxel += 1
 
                 if s.frames_since_voxel >= DOWNSAMPLE_EVERY or len(s.accumulated.points) > MAX_POINTS:
@@ -191,9 +238,44 @@ def visualizator_start(odom, custom):
 
 
     finally:
+        
         try:
+            pts = np.asarray(trajectory.points)[:, :2].astype(np.float32)
+            rect = cv2.minAreaRect(pts)
+            box = cv2.boxPoints(rect)
+            print(box)          
+            
+            poly = mpath.Path(box)
+            
+            grid = square_subdivision(box, n_lado=custom.stops_per_side)
+            malla = grid_lineset(grid, z=0.15)
+
+
+            vis.add_geometry(malla)
+            new_points = np.asarray(s.accumulated.points)
+            new_colors = np.asarray(s.accumulated.colors)
+            mask = poly.contains_points(new_points[:, :2])
+            
+            new_points = new_points[mask]
+            s.pcd.points = o3d.utility.Vector3dVector(new_points)
+            s.pcd.colors = o3d.utility.Vector3dVector(new_colors[mask])
+
+            occ = constructCellMap(new_points, box, n_div=custom.stops_per_side + 1)
+            ocupado = occ > 5
+
+            np.savez(f"cellMap_{int(time.time())}.npz", occupancy=occ, vertices=box, n_div=custom.stops_per_side + 1,z_range=(0.15, 0.8))
+
+            # d = np.load("cellMap_tiempo.npz")
+            # occ = d["occupancy"]
+
+            print(f"Occ = {occ} \n ocupado = {ocupado}")
             while custom.end:
-                # pendiente filtrar por poligono
-                pass
+                
+                vis.update_geometry(s.pcd)
+                if not vis.poll_events():
+                    break
+                vis.update_renderer()
+                
         finally:
             vis.destroy_window()
+            # guardar world axis, la malla y la info de los puntos de cada celda

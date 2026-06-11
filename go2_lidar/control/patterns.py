@@ -5,8 +5,6 @@ from go2_lidar.transforms import _robot_to_world, _wrap_pi
 
 from go2_lidar.control.primitives import _pivot_to_heading_precise, _walk_to
 
-from go2_lidar.mapping.occupancy import OccupancyGrid
-
 def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
               clockwise=False, tolerance=0.165, lidar=None, hit_threshold=5):
     """
@@ -27,15 +25,6 @@ def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
 
     print(f"STARTING YAW IN THE FOLLOWING FORMAT: {yaw0}")
     print(f"YAW TO DEGREES: {math.degrees(yaw0)}")
-
-    grid = None
-    if lidar is not None:
-        grid = OccupancyGrid(
-            step=step, stops_per_side=stops_per_side, clockwise=clockwise,
-            x0=x0, y0=y0, yaw0=yaw0, hit_threshold=hit_threshold,
-        )
-
-    lidar.occupancy = grid
 
     # Dirección y heading ABSOLUTO (en el mundo) de cada lado.
     # El ángulo es relativo a yaw0 -> al sumar yaw0 obtenemos el yaw del mundo
@@ -83,20 +72,12 @@ def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
     for side_num, ((dir_x, dir_y), angle_rel) in enumerate(sides, start=1):
         if side_num == 1:
             base_x, base_y = 0.0, 0.0
-            grid.x_range = (0.0, step)
-            grid.y_range = (-step/2, step/2)
         elif side_num == 2:
             base_x, base_y = step*(stops_per_side) - 0.2, -0.2
-            grid.x_range = (-step/2, step/2)
-            grid.y_range = (-step, 0.0)
         elif side_num == 3:
             base_x, base_y = step*(stops_per_side) - 0.4, -step*(stops_per_side)
-            grid.x_range = (-step, 0.0)
-            grid.y_range = (-step/2, step/2) 
         elif side_num == 4:
             base_x, base_y = -0.20, -step*(stops_per_side) + 0.2
-            grid.x_range = (-step/2, step/2)
-            grid.y_range = (0.0, step)
         # Pivote a HEADING ABSOLUTO del lado (en el mundo), ignorando deriva en XY
         target_heading = _wrap_pi(yaw0 + angle_rel)
         print(f"[SQUARE] Lado {side_num}/4 -> heading mundo "
@@ -129,26 +110,7 @@ def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
                 client.Move(0.0, 0.0, 0.0)
                 time.sleep(0.05)
 
-            # Captura para el mapa de ocupación (robot detenido)
-            if grid is not None:
-                if side_num == 1:
-                    coords = (stops_per_side - i - 1, 0)
-                elif side_num == 2:
-                    coords = (0, i - 1)
-                elif side_num == 3:
-                    coords = (i - 1, stops_per_side)
-                elif side_num == 4:
-                    coords = (stops_per_side, stops_per_side - i - 1)
-                hits = grid.capture(lidar, odom, i, coords)
-                print(f"  [GRID] parada {wp_idx}/{total_wp}: {hits} hits dentro del cuadrado")
-        #base_x += dir_x * side_len
-        #base_y += dir_y * side_len
 
     client.StopMove()
     lidar.end = True
     print("[SQUARE] Cuadrado completado")
-
-    if grid is not None:
-        grid.print_map()
-        grid.save("mapa_ocupacion")
-        print("[GRID] guardado en mapa_ocupacion.npz")

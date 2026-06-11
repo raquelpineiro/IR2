@@ -3,7 +3,12 @@ import math
 import threading
 
 
+"""
 
+LA X Y LA Y ESTAN INTERCAMBIADAS, HAY QUE CAMBIAR LOS RANGOS
+
+
+"""
 
 
 class OccupancyGrid:
@@ -36,26 +41,23 @@ class OccupancyGrid:
             return 0
 
         xyz_lidar = data["xyz"].astype(np.float64, copy=False)
-        xyz_world = xyz_lidar @ odom.R.T + odom.t
+        xyz_rob = (xyz_lidar - odom.t) @ odom.R
+        x_rob, y_rob, z_rob = xyz_rob[:, 0], xyz_rob[:,1], xyz_rob[:, 2]
 
-        # mundo -> frame inicial del cuadrado
-        c, s = math.cos(-self.yaw0), math.sin(-self.yaw0)
         x_lidar, y_lidar, z_lidar = xyz_lidar[:, 0], xyz_lidar[:,1], xyz_lidar[:, 2]
-        if current_stop == self.n - 1:
+        if current_stop == self.n:
             return 0
         else:
+            x_range = (0, 5)
+            y_range = (-5, 0)
+            z_min = 0.05
+            z_max = 0.8
             mask = (
-                (z_lidar > self.z_min) & (z_lidar < self.z_max)
-                & (x_lidar >= self.x_range[0]) & (x_lidar < self.x_range[1]) & (y_lidar >= self.y_range[0]) & (y_lidar < self.y_range[1]))
+                (z_lidar > z_min) & (z_lidar < z_max)
+                & (x_rob >= x_range[0]) & (x_rob < x_range[1]) & (y_rob >= y_range[0]) & 
+                (y_rob < y_range[1]))
             
-            lidar.occupancy = np.column_stack((xyz_lidar[mask][:,0], xyz_lidar[mask][:,1], xyz_lidar[mask][:,2])).astype(np.float64, copy=False)
-            
-            """& (x_lidar >= self.x_range[0] + odom.t[0]) & (x_lidar < self.x_range[1] + odom.t[0])
-            & (y_lidar >= self.y_range[0] + odom.t[1]) & (y_lidar < self.y_range[1] + odom.t[1])"""
-
-                
-            
-
+            lidar.occupancy = xyz_lidar[mask]
 
 
             with self._lock:
