@@ -105,6 +105,36 @@ def constructCellMap(pts, vertices, n_div, z_min = 0.15, z_max=0.8):
     np.add.at(occupancy, (cj, ci), 1)
     return occupancy
 
+def points_per_cell(pts, vertices, n_div, z_min=0.15, z_max=0.8):
+    """Asigna cada punto a su celda (i, j) de la rejilla n_div x n_div.
+
+    Misma lógica que constructCellMap, pero en lugar de acumular el conteo
+    devuelve, para los puntos que caen dentro del cuadrado y del rango z,
+    su índice original en `pts` y los índices de celda (ci, cj).
+    """
+    v = np.asarray(vertices, dtype=float)
+    v0, v1, v3 = v[0], v[1], v[3]
+    e_s = v1 - v0
+    e_t = v3 - v0
+
+    z = pts[:, 2]
+    mask_z = (z >= z_min) & (z <= z_max)
+    idx_z = np.flatnonzero(mask_z)
+    p = pts[mask_z, :2] - v0
+
+    M = np.column_stack([e_s, e_t])
+    st = p @ np.linalg.inv(M).T
+    s_coord, t_coord = st[:, 0], st[:, 1]
+
+    dentro = (s_coord >= 0) & (s_coord < 1) & (t_coord >= 0) & (t_coord < 1)
+    s_coord, t_coord = s_coord[dentro], t_coord[dentro]
+
+    ci = np.floor(s_coord * n_div).astype(int)
+    cj = np.floor(t_coord * n_div).astype(int)
+
+    point_idx = idx_z[dentro]   # índice (en pts) de cada punto asignado
+    return point_idx, ci, cj
+
 class State:
     def __init__(self):
         self.accumulated = o3d.geometry.PointCloud()
@@ -238,15 +268,19 @@ def visualizator_start(odom, custom):
 
 
     finally:
-        
+
+        malla = None
+        box = None
+        cell_points = None
+
         try:
             pts = np.asarray(trajectory.points)[:, :2].astype(np.float32)
             rect = cv2.minAreaRect(pts)
             box = cv2.boxPoints(rect)
-            print(box)          
-            
+            print(box)
+
             poly = mpath.Path(box)
-            
+
             grid = square_subdivision(box, n_lado=custom.stops_per_side)
             malla = grid_lineset(grid, z=0.15)
 
@@ -255,27 +289,67 @@ def visualizator_start(odom, custom):
             new_points = np.asarray(s.accumulated.points)
             new_colors = np.asarray(s.accumulated.colors)
             mask = poly.contains_points(new_points[:, :2])
-            
-            new_points = new_points[mask]
-            s.pcd.points = o3d.utility.Vector3dVector(new_points)
-            s.pcd.colors = o3d.utility.Vector3dVector(new_colors[mask])
 
-            occ = constructCellMap(new_points, box, n_div=custom.stops_per_side + 1)
+            new_points = new_points[mask]
+            new_colors = new_colors[mask]
+            s.pcd.points = o3d.utility.Vector3dVector(new_points)
+            s.pcd.colors = o3d.utility.Vector3dVector(new_colors)
+
+            n_div = custom.stops_per_side + 1
+            occ = constructCellMap(new_points, box, n_div=n_div)
             ocupado = occ > 5
 
-            np.savez(f"cellMap_{int(time.time())}.npz", occupancy=occ, vertices=box, n_div=custom.stops_per_side + 1,z_range=(0.15, 0.8))
+            # Para cada punto dentro del cuadrado, a qué celda (i, j) pertenece
+            point_idx, cell_i, cell_j = points_per_cell(new_points, box, n_div=n_div)
+            cell_points = {
+                "points": new_points,
+                "colors": new_colors,
+                "point_idx": point_idx,
+                "cell_i": cell_i,
+                "cell_j": cell_j,
+            }
+
+            np.savez(f"cellMap_{int(time.time())}.npz", occupancy=occ, vertices=box, n_div=n_div,z_range=(0.15, 0.8))
 
             # d = np.load("cellMap_tiempo.npz")
             # occ = d["occupancy"]
 
             print(f"Occ = {occ} \n ocupado = {ocupado}")
             while custom.end:
-                
+
                 vis.update_geometry(s.pcd)
                 if not vis.poll_events():
                     break
                 vis.update_renderer()
-                
+
+            return {
+                "point_cloud": s.pcd,
+                "accumulated": s.accumulated,
+                "world_axis": world_axis,
+                "malla": malla,
+                "vertices": box,
+                "n_div": n_div,
+                "occupancy": occ,
+                "occupied": ocupado,
+                "cell_points": cell_points,
+            }
+
         finally:
             vis.destroy_window()
             # guardar world axis, la malla y la info de los puntos de cada celda
+            ts = int(time.time())
+            o3d.io.write_triangle_mesh(f"world_axis_{ts}.ply", world_axis)
+            if malla is not None:
+                o3d.io.write_line_set(f"malla_{ts}.ply", malla)
+            if box is not None and cell_points is not None:
+                np.savez(
+                    f"cellPoints_{ts}.npz",
+                    points=cell_points["points"],
+                    colors=cell_points["colors"],
+                    point_idx=cell_points["point_idx"],
+                    cell_i=cell_points["cell_i"],
+                    cell_j=cell_points["cell_j"],
+                    vertices=box,
+                    n_div=custom.stops_per_side + 1,
+                )
+            print(f"[guardado] world_axis_{ts}.ply  malla_{ts}.ply  cellPoints_{ts}.npz")

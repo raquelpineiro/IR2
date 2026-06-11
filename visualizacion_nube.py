@@ -82,6 +82,41 @@ def colorize_by_z(xyz, z_min=Z_RANGE[0], z_max=Z_RANGE[1]):
     return np.stack([r, g, b], axis=1).astype(np.float64)
 
 
+def convex_hull_2d(points):
+    """Casco convexo en planta (monotone chain). Usa solo XY. Devuelve vértices CCW (M, 2)."""
+    pts = np.unique(np.asarray(points, dtype=np.float64)[:, :2], axis=0)
+    if len(pts) < 3:
+        return pts
+    pts = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+
+    def cross2d(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    def build(seq):
+        h = []
+        for p in seq:
+            while len(h) >= 2 and cross2d(h[-2], h[-1], p) <= 0:
+                h.pop()
+            h.append(p)
+        return h
+
+    lower = build(pts)
+    upper = build(pts[::-1])
+    return np.array(lower[:-1] + upper[:-1])
+
+
+def points_inside_hull_xy(xyz, hull):
+    """Máscara booleana: True si la proyección XY del punto cae dentro del polígono convexo (CCW)."""
+    xy = np.asarray(xyz)[:, :2]
+    inside = np.ones(len(xy), dtype=bool)
+    for a, b in zip(hull, np.roll(hull, -1, axis=0)):
+        cross = (b[0] - a[0]) * (xy[:, 1] - a[1]) - (b[1] - a[1]) * (xy[:, 0] - a[0])
+        inside &= cross >= 0.0
+        if not inside.any():
+            break
+    return inside
+
+
 def post_process(pcd, robot_pos):
     if len(pcd.points) < 50:
         return pcd
@@ -201,17 +236,20 @@ def main():
 
                 frame_pcd = o3d.geometry.PointCloud()
 
-                x_lidar, y_lidar, z_lidar = xyz_lidar[:, 0], xyz_lidar[:,1], xyz_lidar[:, 2]
+                # Pasar los puntos al sistema de referencia del robot (pose inversa):
+                # asi la caja de filtrado gira y se traslada con el robot.
+                xyz_robot = (xyz_lidar - odom.t) @ odom.R
+                x_rob, y_rob, z_rob = xyz_robot[:, 0], xyz_robot[:, 1], xyz_robot[:, 2]
                 x_range = (0, 5)
                 y_range = (-5, 0)
                 z_min = 0.1
                 z_max = 0.8
                 mask = (
-                    (z_lidar > z_min) & (z_lidar < z_max)
-                    & (x_lidar >= x_range[0] + odom.t[0]) & (x_lidar < x_range[1] + odom.t[0]) & (y_lidar >= y_range[0] + odom.t[1]) & 
-                    (y_lidar < y_range[1] + odom.t[1]))
+                    (z_rob > z_min) & (z_rob < z_max)
+                    & (x_rob >= x_range[0]) & (x_rob < x_range[1])
+                    & (y_rob >= y_range[0]) & (y_rob < y_range[1]))
                 frame_pcd.points = o3d.utility.Vector3dVector(xyz_lidar[mask])
-                frame_pcd.colors = o3d.utility.Vector3dVector(colors)
+                frame_pcd.colors = o3d.utility.Vector3dVector(colors[mask])
                 s.accumulated += frame_pcd
                 s.frames_since_voxel += 1
 
