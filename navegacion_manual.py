@@ -19,8 +19,8 @@ class Custom2(Custom):
     def __init__(self, topic="rt/utlidar/cloud"):
         super().__init__(topic)
         self.end = False
-        self.occupancy = None
-
+        self.side = 0
+        self.stops_per_side = 1
 def main():
     if len(sys.argv) > 1:
         ChannelFactoryInitialize(0, sys.argv[1])
@@ -28,6 +28,8 @@ def main():
         ChannelFactoryInitialize(0)
 
     custom = Custom2(TOPIC_CLOUD)
+    num_stops = 2
+    custom.stops_per_side = num_stops
     odom = OdomTracker()
 
     # --- NUEVO: Inicializar cliente de movimiento y lanzar hilo ---
@@ -40,7 +42,7 @@ def main():
     nav_thread = threading.Thread(
         target=do_square,
         kwargs=dict(client=client, odom=odom, lidar=custom,
-                    step=0.60, stops_per_side=2, pause_s=1.0,
+                    step=0.60, stops_per_side=num_stops, pause_s=1.0,
                     clockwise=True),
         daemon=True
     )
