@@ -4,7 +4,7 @@ import time
 import cv2
 import matplotlib.path as mpath
 
-from go2_lidar.transforms import get_yaw_from_rot
+from go2_lidar.transforms import get_yaw_from_rot, _robot_to_world, _world_to_robot
 
 OUTLIER_NB = 20
 OUTLIER_STD = 2.0
@@ -12,6 +12,8 @@ NORMAL_RADIUS = 0.20
 NORMAL_MAX_NN = 30
 
 TRAJ_MIN_STEP = 0.03         # 3 cm: paso mínimo para añadir vértice de trayectoria
+BOX_MARGIN = 0.20            # 20 cm: amplía el cuadrado del grid hacia fuera para
+                             # incluir las casillas por las que pasa el robot
 
 
 VOXEL_SIZE = 0.04            # 4 cm — algo más fino para suavizar mejor
@@ -82,6 +84,44 @@ def grid_lineset(grid, z=0.0, color=(1.0, 0.3, 0.3)):
     ls = o3d.geometry.LineSet(o3d.utility.Vector3dVector(pts3), o3d.utility.Vector2iVector(np.asarray(lines)),)
     ls.colors = o3d.utility.Vector3dVector(np.tile(color, (len(lines), 1)))
     return ls
+
+def clean_box_from_trajectory(traj_xy, origin, margin=BOX_MARGIN):
+    """Caja de la malla ALINEADA con el frame de arranque del robot.
+
+    En vez de un minAreaRect (cuyo orden de esquinas es arbitrario y puede salir
+    girado), construye el rectángulo (AABB) de la trayectoria en el frame
+    relativo al arranque —ejes = delante/izquierda del robot— y lo devuelve en
+    coordenadas del mundo. Ordena las esquinas para que `v0` sea la esquina de
+    ARRANQUE: así esa esquina es la celda (0,0) y los giros entre celdas salen de
+    90°.
+
+    `margin` (m) amplía el cuadrado hacia fuera por los 4 lados: la trayectoria
+    es el camino del CENTRO del robot, así que el AABB se queda corto respecto al
+    área que el robot realmente ocupa; ampliándolo se incluyen las casillas por
+    las que pasa y su arranque queda holgadamente dentro de la celda (0,0).
+
+    Si no hay `origin`, cae al minAreaRect de siempre (también ampliado).
+    """
+    traj_xy = np.asarray(traj_xy, dtype=float)
+    if origin is None or len(traj_xy) < 2:
+        (cx, cy), (w, h), ang = cv2.minAreaRect(traj_xy.astype(np.float32))
+        return cv2.boxPoints(((cx, cy), (w + 2 * margin, h + 2 * margin), ang))
+
+    ox, oy, oyaw = origin
+    rel = np.array([_world_to_robot(x, y, ox, oy, oyaw) for x, y in traj_xy])
+    smin, smax = rel[:, 0].min() - margin, rel[:, 0].max() + margin
+    tmin, tmax = rel[:, 1].min() - margin, rel[:, 1].max() + margin
+
+    # Esquina de arranque = la más cercana al origen relativo (0,0).
+    s0 = smin if abs(smin) <= abs(smax) else smax
+    s1 = smax if s0 == smin else smin
+    t0 = tmin if abs(tmin) <= abs(tmax) else tmax
+    t1 = tmax if t0 == tmin else tmin
+
+    box_rel = [(s0, t0), (s1, t0), (s1, t1), (s0, t1)]   # v0=arranque, e_s, e_t
+    return np.array([_robot_to_world(x, y, ox, oy, oyaw) for x, y in box_rel],
+                    dtype=float)
+
 
 def constructCellMap(pts, vertices, n_div, z_min = 0.15, z_max=0.8):
     v = np.asarray(vertices, dtype=float)
@@ -280,9 +320,11 @@ def visualizator_start(odom, custom):
         cell_points = None
 
         try:
-            pts = np.asarray(trajectory.points)[:, :2].astype(np.float32)
-            rect = cv2.minAreaRect(pts)
-            box = cv2.boxPoints(rect)
+            pts = np.asarray(trajectory.points)[:, :2]
+            # Caja alineada al arranque del robot: la esquina de arranque es v0
+            # (-> celda (0,0)) y los ejes van delante/izquierda. Más estable y
+            # navegable que el minAreaRect.
+            box = clean_box_from_trajectory(pts, s.origin)
             print(box)
 
             poly = mpath.Path(box)
