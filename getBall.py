@@ -46,6 +46,11 @@ from go2_lidar.mapping.accumulator import (
 TOPIC_CLOUD = "rt/utlidar/cloud_deskewed"
 
 HIT_THRESHOLD = 5            # conteo de puntos por celda para considerarla ocupada
+# Banda de altura para DETECTAR la pelota (objeto bajo): por debajo del rango
+# del mapeo (z=0.15-0.8, pensado para paredes). z_min por encima del ruido del
+# suelo para no llenar la rejilla de falsos positivos; z_max donde acabe la
+# pelota. Bájalo/súbelo según el tamaño real de la pelota.
+BALL_Z_RANGE = (0.03, 0.35)
 GREEN_LO = np.array([35, 70, 50], dtype=np.uint8)    # verde en HSV (OpenCV: H 0-179)
 GREEN_HI = np.array([85, 255, 255], dtype=np.uint8)
 GREEN_MIN_AREA = 500         # área mínima (px) del blob verde para darlo por válido
@@ -385,7 +390,7 @@ def main():
     video_lock = threading.Lock()
 
     detect_new_cells = make_new_cell_detector(lidar, baseline_occupied, box,
-                                              n_div, z_range, cloud_lock,
+                                              n_div, BALL_Z_RANGE, cloud_lock,
                                               hit_threshold=HIT_THRESHOLD)
     confirm_ball = make_confirm_ball(video, video_lock)
 

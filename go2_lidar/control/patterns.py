@@ -283,7 +283,7 @@ def _look_level(client, settle_s=0.3):
 
 def autonomous_movement(client, odom, occupancy, vertices, n_div,
                         detect_new_cells, confirm_ball,
-                        hit_threshold=5, pause_s=0.5, tolerance=0.165,
+                        hit_threshold=5, pause_s=0.5, cell_tolerance=0.08,
                         camera_pitch=0.5, settle_s=0.6, explore=True):
     """
     Busca un objeto nuevo (la pelota) sobre la rejilla de ocupación.
@@ -308,6 +308,15 @@ def autonomous_movement(client, odom, occupancy, vertices, n_div,
     free = ~(occupancy > hit_threshold)
     centers = _cell_centers_world(vertices, n_div)
 
+    # Rumbos ABSOLUTOS de los ejes de la rejilla (en el mundo): +columna sigue
+    # la arista e_s = v1-v0 y +fila la arista e_t = v3-v0. Como la malla está
+    # re-anclada al heading del robot, moverse entre celdas perpendiculares es un
+    # giro exacto de 90° y el paso es justo una casilla.
+    v = np.asarray(vertices, dtype=float)
+    e_s, e_t = v[1] - v[0], v[3] - v[0]
+    h_col = math.atan2(e_s[1], e_s[0])
+    h_row = math.atan2(e_t[1], e_t[0])
+
     odom._wait_for_pose()
     odom._initial_frame()
 
@@ -320,18 +329,34 @@ def autonomous_movement(client, odom, occupancy, vertices, n_div,
         return (r, c)
 
     def walk_path(path):
-        """Camina por las celdas de `path` (la primera es la actual)."""
-        for (r, c) in path[1:]:
+        """Camina por las celdas de `path` (la primera es la actual), pivotando
+        al rumbo EXACTO del eje de la rejilla en cada salto."""
+        for i in range(1, len(path)):
+            pr, pc = path[i - 1]
+            r, c = path[i]
+            drow, dcol = r - pr, c - pc
+            if dcol == 1:
+                heading = h_col
+            elif dcol == -1:
+                heading = h_col + math.pi
+            elif drow == 1:
+                heading = h_row
+            else:
+                heading = h_row + math.pi
             wx, wy = centers[r, c]
-            print(f"[AUTO] -> celda ({r},{c})  mundo=({wx:+.2f},{wy:+.2f})")
-            _go_to_world_xy(wx, wy, client, odom, tolerance=tolerance)
+            print(f"[AUTO] -> celda ({r},{c})  rumbo={math.degrees(_wrap_pi(heading)):+.0f}°")
+            _pivot_to_heading_precise(_wrap_pi(heading), client, odom, tag="step")
+            _walk_to(wx, wy, client, odom, tolerance=cell_tolerance)
             _hold(client, pause_s)
+
+    # La casilla inicial es siempre la (0,0) (el robot arranca en su centro).
+    start_cell = (0, 0) if free[0, 0] else cur_cell()
 
     # Orden de exploración (fallback cuando no se ve ningún objeto nuevo).
     explore_order = []
     if explore:
         seen = set()
-        for cell in _coverage_walk(free, cur_cell()):
+        for cell in _coverage_walk(free, start_cell):
             if cell not in seen:
                 seen.add(cell)
                 explore_order.append(cell)
