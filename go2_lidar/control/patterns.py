@@ -384,12 +384,11 @@ def autonomous_movement(client, odom, occupancy, vertices, n_div,
             # El StandDown/StandUp puede haber desviado el rumbo: re-encarar.
             _pivot_to_heading_precise(heading, client, odom, tag="reencarar")
 
-        # Avance RELATIVO de exactamente una celda hacia delante (frame del
-        # robot) + centrado fino al llegar. El destino es la posición actual
-        # desplazada `pitch` metros en el rumbo del eje de la rejilla.
-        cur_x, cur_y = float(odom.t[0]), float(odom.t[1])
-        wx = cur_x + pitch * math.cos(heading)
-        wy = cur_y + pitch * math.sin(heading)
+        # Navegación ABSOLUTA al centro de la casilla destino. Es auto-correctiva
+        # (no acumula deriva): aunque el robot llegue algo desviado, apunta al
+        # centro real de la celda, así su casilla real coincide con la del grid
+        # (no "cree" estar en la siguiente) y no se queda corto al final.
+        wx, wy = centers[b]
         _walk_to(wx, wy, client, odom, tolerance=cell_tolerance, min_v=min_v)
         _hold(client, pause_s)
         here = cur_cell()

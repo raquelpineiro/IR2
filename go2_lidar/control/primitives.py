@@ -114,7 +114,7 @@ def _walk_to(target_x, target_y, client, odom, tolerance=0.1, min_v=0.0):
         # Si la desviación crece demasiado, re-pivotar antes de seguir
         if abs(yaw_error) > yaw_redo_threshold:
             print(f"ESTOY ENTRANDO")
-            return _pivot_then_walk(target_x, target_y, client, odom, tolerance)
+            return _pivot_then_walk(target_x, target_y, client, odom, tolerance, min_v)
 
         vx = max(-max_v, min(max_v, Kp_v * distance))
         if min_v and vx < min_v:          # banda muerta: garantizar avance real
@@ -132,9 +132,9 @@ def _walk_to(target_x, target_y, client, odom, tolerance=0.1, min_v=0.0):
         time.sleep(0.05)
 
 
-def _pivot_then_walk(target_x, target_y, client, odom, tolerance):
+def _pivot_then_walk(target_x, target_y, client, odom, tolerance, min_v=0.0):
     _pivot_to_face(target_x, target_y, client, odom)
-    _walk_to(target_x, target_y, client, odom, tolerance=tolerance)
+    _walk_to(target_x, target_y, client, odom, tolerance=tolerance, min_v=min_v)
 
 
 def _go_to_world_xy(target_x, target_y, client, odom, tolerance=0.1):
