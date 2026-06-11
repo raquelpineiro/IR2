@@ -1,6 +1,8 @@
 import time
 import math
 
+from collections import deque
+
 import numpy as np
 
 from go2_lidar.transforms import _robot_to_world, _wrap_pi
@@ -207,75 +209,205 @@ def _hold(client, secs):
         time.sleep(0.05)
 
 
-def autonomous_movement(client, odom, occupancy, vertices, n_div, check_ball,
-                        hit_threshold=5, pause_s=1.0, tolerance=0.165,
-                        scan_headings=None, settle_s=0.5):
-    """
-    Recorre las celdas LIBRES de una rejilla de ocupación buscando la pelota.
+def _free_neighbors(free, cell):
+    """Vecinos 4-conexos transitables (True en `free`) de una celda."""
+    r, c = cell
+    n_rows, n_cols = free.shape
+    out = []
+    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < n_rows and 0 <= nc < n_cols and free[nr, nc]:
+            out.append((nr, nc))
+    return out
 
-    `occupancy` es la rejilla n_div x n_div obtenida con navegacion_manual.py;
-    las celdas con conteo > `hit_threshold` se consideran ocupadas y no se
-    pisan. El robot va de casilla en casilla moviéndose solo en horizontal o
-    vertical (recorrido 4-conexo) y, en cada casilla nueva, gira encarando los
-    `scan_headings` (por defecto N, E, S, O relativos al yaw inicial) y llama a
-    `check_ball()`.
 
-    `check_ball()` debe devolver la celda (fila, col) donde está la pelota si la
-    detecta, o None. En cuanto devuelve una celda, el robot se detiene y esta
-    función retorna esa celda. Si recorre todo sin éxito, devuelve None.
-    """
-    occupancy = np.asarray(occupancy)
-    occupied = occupancy > hit_threshold
-    free = ~occupied
-    centers = _cell_centers_world(vertices, n_div)
+def _bfs_path(free, start, goals):
+    """Camino 4-conexo más corto (BFS) por celdas transitables desde `start`
+    hasta cualquier celda de `goals`. Devuelve la lista de celdas (incluido
+    `start`) o None si no hay ruta."""
+    goals = set(goals)
+    if start in goals:
+        return [start]
+    prev = {start: None}
+    q = deque([start])
+    while q:
+        cur = q.popleft()
+        for nb in _free_neighbors(free, cur):
+            if nb not in prev:
+                prev[nb] = cur
+                if nb in goals:
+                    path = [nb]
+                    p = cur
+                    while p is not None:
+                        path.append(p)
+                        p = prev[p]
+                    return path[::-1]
+                q.append(nb)
+    return None
 
-    odom._wait_for_pose()
-    x0, y0, yaw0 = odom._initial_frame()
 
-    if scan_headings is None:
-        scan_headings = [0.0, math.pi / 2, math.pi, -math.pi / 2]
-
-    # Celda de partida: la del robot si es libre, si no la libre más cercana.
-    r0, c0 = _world_to_cell(vertices, n_div, odom.t[:2])
-    if not (0 <= r0 < n_div and 0 <= c0 < n_div and free[r0, c0]):
-        r0, c0 = _nearest_free(free, centers, odom.t[:2])
-
-    walk = _coverage_walk(free, (r0, c0))
-    print(f"[AUTO] {int(free.sum())} celdas libres; recorrido de {len(walk)} "
-          f"pasos desde la celda {(r0, c0)}")
-
-    # Asegurar gait de marcha y precalentar (igual que do_square).
-    print("[AUTO] BalanceStand + ClassicWalk")
+def _ensure_walk(client, warmup_s=0.6):
+    """Pone al robot en gait de marcha (tras un BalanceStand/Euler hay que
+    reactivarlo) y precalienta brevemente para que las patas entren en cadencia."""
     client.BalanceStand()
-    time.sleep(0.6)
+    time.sleep(0.3)
     client.ClassicWalk(True)
-    time.sleep(0.4)
-    warmup_end = time.time() + 1.2
-    while time.time() < warmup_end:
+    time.sleep(0.3)
+    end = time.time() + warmup_s
+    while time.time() < end:
         client.Move(0.0, 0.0, 0.0)
         time.sleep(0.05)
 
-    scanned = set()
-    for (r, c) in walk:
-        wx, wy = centers[r, c]
-        print(f"[AUTO] -> celda ({r},{c})  mundo=({wx:+.2f},{wy:+.2f})")
-        _go_to_world_xy(wx, wy, client, odom, tolerance=tolerance)
-        _hold(client, pause_s)
 
-        if (r, c) in scanned:
-            continue
-        scanned.add((r, c))
-
-        # Escaneo: gira encarando cada heading y mira si hay pelota.
-        for ang in scan_headings:
-            _pivot_to_heading_precise(_wrap_pi(yaw0 + ang), client, odom, tag="scan")
-            _hold(client, settle_s)
-            found = check_ball()
-            if found is not None:
-                client.StopMove()
-                print(f"[AUTO] ¡Pelota detectada en la celda {found}!")
-                return found
-
+def _look_down(client, pitch, settle_s=0.6):
+    """Inclina el cuerpo (morro abajo) para que la cámara apunte al suelo/objeto.
+    La cámara del Go2 es fija; la única forma de bajar su mirada es el pitch del
+    cuerpo vía Euler() en modo BalanceStand."""
     client.StopMove()
-    print("[AUTO] Recorrido completado: no se encontró la pelota")
-    return None
+    client.BalanceStand()
+    time.sleep(0.3)
+    if hasattr(client, "Euler"):
+        client.Euler(0.0, float(pitch), 0.0)
+    else:
+        print("[AUTO] AVISO: SportClient no expone Euler(); no puedo inclinar la cámara")
+    time.sleep(settle_s)
+
+
+def _look_level(client, settle_s=0.3):
+    """Devuelve el cuerpo a la horizontal."""
+    if hasattr(client, "Euler"):
+        client.Euler(0.0, 0.0, 0.0)
+    client.BalanceStand()
+    time.sleep(settle_s)
+
+
+def autonomous_movement(client, odom, occupancy, vertices, n_div,
+                        detect_new_cells, confirm_ball,
+                        hit_threshold=5, pause_s=0.5, tolerance=0.165,
+                        camera_pitch=0.5, settle_s=0.6, explore=True):
+    """
+    Busca un objeto nuevo (la pelota) sobre la rejilla de ocupación.
+
+    Estrategia:
+      1. `detect_new_cells()` (LiDAR) devuelve las celdas que estaban LIBRES en
+         el mapa base y ahora aparecen ocupadas: candidatas a objeto nuevo.
+      2. El robot navega hasta una casilla libre CONTIGUA al candidato más
+         cercano (BFS 4-conexo), evitando tanto las celdas ocupadas del mapa
+         base como las nuevas (no choca con el objeto).
+      3. Encara el candidato, baja la cámara con un `pitch` del cuerpo y llama a
+         `confirm_ball()` (cámara) para ver si es verde.
+      4. Si lo confirma, se detiene y devuelve la celda (fila, col). Si no, la
+         descarta y sigue. Si no hay candidatos visibles y `explore=True`, se
+         mueve por celdas libres para ganar visión.
+
+    `detect_new_cells()` -> lista de celdas (fila, col).
+    `confirm_ball()` -> bool.
+    Devuelve la celda de la pelota, o None si no la encuentra.
+    """
+    occupancy = np.asarray(occupancy)
+    free = ~(occupancy > hit_threshold)
+    centers = _cell_centers_world(vertices, n_div)
+
+    odom._wait_for_pose()
+    odom._initial_frame()
+
+    def cur_cell():
+        r, c = _world_to_cell(vertices, n_div, odom.t[:2])
+        r = int(np.clip(r, 0, n_div - 1))
+        c = int(np.clip(c, 0, n_div - 1))
+        if not free[r, c]:
+            r, c = _nearest_free(free, centers, odom.t[:2])
+        return (r, c)
+
+    def walk_path(path):
+        """Camina por las celdas de `path` (la primera es la actual)."""
+        for (r, c) in path[1:]:
+            wx, wy = centers[r, c]
+            print(f"[AUTO] -> celda ({r},{c})  mundo=({wx:+.2f},{wy:+.2f})")
+            _go_to_world_xy(wx, wy, client, odom, tolerance=tolerance)
+            _hold(client, pause_s)
+
+    # Orden de exploración (fallback cuando no se ve ningún objeto nuevo).
+    explore_order = []
+    if explore:
+        seen = set()
+        for cell in _coverage_walk(free, cur_cell()):
+            if cell not in seen:
+                seen.add(cell)
+                explore_order.append(cell)
+    ei = 0
+
+    print(f"[AUTO] {int(free.sum())} celdas libres. BalanceStand + ClassicWalk")
+    _ensure_walk(client, warmup_s=1.2)
+
+    checked = set()     # candidatos ya inspeccionados que NO eran la pelota
+
+    while True:
+        new_cells = [tuple(int(v) for v in c) for c in detect_new_cells()]
+        new_set = {c for c in new_cells if 0 <= c[0] < n_div and 0 <= c[1] < n_div}
+
+        # Rejilla transitable: libres del mapa base MENOS los objetos nuevos.
+        nav_free = free.copy()
+        for (r, c) in new_set:
+            nav_free[r, c] = False
+        cur = cur_cell()
+        nav_free[cur] = True    # nunca bloquear la celda donde está el robot
+
+        cands = [c for c in new_set if c not in checked]
+        if cands:
+            best, best_path = None, None
+            for cand in cands:
+                goals = _free_neighbors(nav_free, cand)
+                if not goals:
+                    checked.add(cand)       # rodeado de ocupadas: inalcanzable
+                    continue
+                p = _bfs_path(nav_free, cur, goals)
+                if p is not None and (best_path is None or len(p) < len(best_path)):
+                    best, best_path = cand, p
+
+            if best is not None:
+                print(f"[AUTO] Investigando celda nueva {best} "
+                      f"({len(best_path) - 1} pasos)")
+                _ensure_walk(client)
+                walk_path(best_path)
+
+                # Encarar el candidato desde la casilla contigua.
+                stand = best_path[-1]
+                sx, sy = centers[stand]
+                tx, ty = centers[best]
+                heading = math.atan2(ty - sy, tx - sx)
+                _pivot_to_heading_precise(_wrap_pi(heading), client, odom, tag="face")
+                _hold(client, 0.3)
+
+                # Bajar la cámara (pitch) y confirmar con la cámara.
+                _look_down(client, camera_pitch, settle_s)
+                found = confirm_ball()
+                _look_level(client)
+
+                if found:
+                    client.StopMove()
+                    print(f"[AUTO] ¡Pelota confirmada en la celda {best}!")
+                    return best
+
+                print(f"[AUTO] La celda {best} no es la pelota; descartada")
+                checked.add(best)
+                continue        # re-detectar desde la nueva posición
+
+        # Sin candidatos accionables: explorar para ganar visión.
+        moved = False
+        while ei < len(explore_order):
+            tgt = explore_order[ei]
+            ei += 1
+            if tgt == cur or not nav_free[tgt]:
+                continue
+            p = _bfs_path(nav_free, cur, {tgt})
+            if p is not None and len(p) > 1:
+                print(f"[AUTO] Explorando hacia {tgt}")
+                _ensure_walk(client)
+                walk_path(p)
+                moved = True
+                break
+        if not moved:
+            client.StopMove()
+            print("[AUTO] No hay objetos nuevos por confirmar ni zonas por explorar")
+            return None

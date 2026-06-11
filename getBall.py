@@ -2,17 +2,19 @@
 Búsqueda autónoma de una pelota verde sobre la malla de ocupación.
 
 Usa la rejilla de ocupación generada por navegacion_manual.py (cellMap_*.npz):
-el robot recorre las celdas LIBRES moviéndose de casilla en casilla (solo en
-horizontal o vertical) y, en cada una, gira escaneando el entorno. La detección
-fusiona cámara y LiDAR:
 
-  - Cámara (VideoClient): confirma que hay VERDE en el campo de visión
-    (umbral en HSV con OpenCV).
-  - LiDAR: cuando hay verde, busca qué celda —antes libre— ha pasado a estar
-    ocupada respecto al mapa base. Esa celda es la posición de la pelota.
+  - LiDAR: detecta las celdas que estaban LIBRES en el mapa base y ahora
+    aparecen ocupadas (objetos nuevos).
+  - El robot navega hacia el objeto nuevo más cercano por celdas libres (BFS),
+    evitando tanto las celdas ocupadas del mapa base como las nuevas.
+  - Al llegar a una casilla contigua, inclina el cuerpo (pitch) para que la
+    cámara mire hacia el objeto y confirma con la cámara (VideoClient + HSV) si
+    es VERDE. Si lo es, devuelve su posición; si no, lo descarta y sigue.
 
 La visualización (Open3D) muestra la malla, los ejes, las celdas ocupadas del
-mapa base y, al encontrarla, pinta en verde la celda con la pelota.
+mapa base y, al encontrarla, pinta en verde la celda con la pelota. Además abre
+una ventana con la imagen de la cámara (verde resaltado) refrescada cada cierto
+tiempo.
 
 Uso:
     python getBall.py [interfaz_red] [ruta_cellMap.npz]
@@ -52,6 +54,7 @@ VOXEL_SIZE = 0.04
 DOWNSAMPLE_EVERY = 10
 
 CAMERA_PERIOD = 1.0          # cada cuántos segundos refrescar la ventana de cámara
+CAMERA_PITCH = 0.5           # pitch del cuerpo (rad) al acercarse, para mirar al suelo
 
 
 class Search:
@@ -139,44 +142,50 @@ def _sees_green(video):
     return max(cv2.contourArea(c) for c in cnts) >= GREEN_MIN_AREA
 
 
-def make_detector(lidar, video, baseline_occupied, box, n_div, z_range,
-                  search, cloud_lock, video_lock, hit_threshold=HIT_THRESHOLD):
+def make_new_cell_detector(lidar, baseline_occupied, box, n_div, z_range,
+                           cloud_lock, hit_threshold=HIT_THRESHOLD):
     """
-    Devuelve check_ball() -> (fila, col) | None.
+    Devuelve detect_new_cells() -> lista de celdas (fila, col).
 
-    Cámara + LiDAR: solo si la cámara ve verde, mira en el LiDAR qué celda
-    —libre en el mapa base— está ahora ocupada. Esa es la pelota.
+    Solo LiDAR: construye la ocupación actual y devuelve las celdas que estaban
+    LIBRES en el mapa base y ahora superan el umbral de puntos (objetos nuevos).
     """
     z_min, z_max = z_range
 
-    def check_ball():
-        with video_lock:
-            green = _sees_green(video)
-        if not green:
-            return None
-
+    def detect_new_cells():
         with cloud_lock:
             data = lidar.get_cloud()
         if data is None or len(data["xyz"]) == 0:
-            return None
-
+            return []
         xyz = data["xyz"].astype(np.float64, copy=False)
         current = constructCellMap(xyz, box, n_div, z_min=z_min, z_max=z_max)
-
-        # Celdas nuevas: ahora ocupadas pero libres en el mapa base.
         new_occ = (current > hit_threshold) & (~baseline_occupied)
-        if not new_occ.any():
-            return None
+        cells = [(int(r), int(c)) for r, c in zip(*np.where(new_occ))]
+        if cells:
+            print(f"[DET] Celdas nuevas ocupadas (LiDAR): {cells}")
+        return cells
 
-        cand = np.where(new_occ, current, -1)
-        r, c = np.unravel_index(int(np.argmax(cand)), cand.shape)
-        search.ball_cell = (int(r), int(c))
-        search.ball_count = int(current[r, c])
-        print(f"[DET] Verde confirmado + celda nueva ocupada {(int(r), int(c))} "
-              f"({int(current[r, c])} pts)")
-        return (int(r), int(c))
+    return detect_new_cells
 
-    return check_ball
+
+def make_confirm_ball(video, video_lock, n_frames=4, settle=0.12):
+    """
+    Devuelve confirm_ball() -> bool.
+
+    Solo cámara: con el robot ya inclinado (pitch) hacia el objeto, captura
+    varios fotogramas y confirma si hay verde en alguno de ellos.
+    """
+    def confirm_ball():
+        for _ in range(n_frames):
+            with video_lock:
+                green = _sees_green(video)
+            if green:
+                print("[DET] Verde confirmado por la cámara")
+                return True
+            time.sleep(settle)
+        return False
+
+    return confirm_ball
 
 
 # --------------------------------------------------------------------------- #
@@ -375,16 +384,21 @@ def main():
     cloud_lock = threading.Lock()
     video_lock = threading.Lock()
 
-    check_ball = make_detector(lidar, video, baseline_occupied, box, n_div,
-                               z_range, search, cloud_lock, video_lock,
-                               hit_threshold=HIT_THRESHOLD)
+    detect_new_cells = make_new_cell_detector(lidar, baseline_occupied, box,
+                                              n_div, z_range, cloud_lock,
+                                              hit_threshold=HIT_THRESHOLD)
+    confirm_ball = make_confirm_ball(video, video_lock)
 
     def run_search():
         try:
-            search.result = autonomous_movement(
-                client, odom, occ, box, n_div, check_ball,
-                hit_threshold=HIT_THRESHOLD,
+            cell = autonomous_movement(
+                client, odom, occ, box, n_div,
+                detect_new_cells, confirm_ball,
+                hit_threshold=HIT_THRESHOLD, camera_pitch=CAMERA_PITCH,
             )
+            if cell is not None:
+                search.ball_cell = cell
+            search.result = cell
         finally:
             search.end = True
 
@@ -396,8 +410,7 @@ def main():
 
     if search.ball_cell is not None:
         r, c = search.ball_cell
-        print(f"\n>>> PELOTA ENCONTRADA en la celda fila={r}, col={c} "
-              f"({search.ball_count} puntos LiDAR)")
+        print(f"\n>>> PELOTA ENCONTRADA en la celda fila={r}, col={c}")
     else:
         print("\n>>> No se detectó la pelota durante el recorrido")
 
