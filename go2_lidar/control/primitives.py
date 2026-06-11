@@ -73,11 +73,18 @@ def _pivot_to_face(target_x, target_y, client, odom,
         return
 
 
-def _walk_to(target_x, target_y, client, odom, tolerance=0.1):
+def _walk_to(target_x, target_y, client, odom, tolerance=0.1, min_v=0.0):
     """
     Fase 2: avanza hacia (target_x, target_y) con correcciones suaves
     de yaw para mantener el rumbo. Si el error de yaw crece más allá del
     umbral, vuelve a pivotar y reintenta.
+
+    `min_v` (m/s): velocidad lineal mínima útil. El Go2 ignora vx muy
+    pequeños (banda muerta del gait), así que cerca del destino el control P
+    pediría una vx tan baja que el robot no avanza y se queda oscilando justo
+    fuera de tolerancia. Con `min_v > 0` se fuerza ese mínimo mientras sigamos
+    fuera de tolerancia (útil para tolerancias finas de centrado). Por defecto
+    0 -> comportamiento original.
     """
     Kp_v = 0.6
     Kp_w = 1.0
@@ -110,6 +117,8 @@ def _walk_to(target_x, target_y, client, odom, tolerance=0.1):
             return _pivot_then_walk(target_x, target_y, client, odom, tolerance)
 
         vx = max(-max_v, min(max_v, Kp_v * distance))
+        if min_v and vx < min_v:          # banda muerta: garantizar avance real
+            vx = min_v
         vyaw = max(-max_w, min(max_w, Kp_w * yaw_error))
         client.Move(vx, 0.0, vyaw)
 

@@ -1,5 +1,6 @@
 import sys
 import time
+import glob
 import numpy as np
 import open3d as o3d
 
@@ -7,6 +8,10 @@ from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitial
 from unitree_sdk2py.idl.geometry_msgs.msg.dds_ import PoseStamped_
 
 from obtencion_nube_puntos import Custom
+
+from go2_lidar.mapping.accumulator import square_subdivision, grid_lineset
+
+GRID_HIT_THRESHOLD = 5       # conteo de puntos por celda para pintarla como ocupada
 
 
 TOPIC_CLOUD = "rt/utlidar/cloud_deskewed"
@@ -128,12 +133,57 @@ def post_process(pcd, robot_pos):
     return cleaned
 
 
+def _cell_quad(box, n_div, r, c, z=0.02, color=(0.6, 0.2, 0.2)):
+    """Cuadrado relleno (TriangleMesh) sobre la celda (fila r, col c) del grid."""
+    v = np.asarray(box, dtype=float)
+    v0, e_s, e_t = v[0], v[1] - v[0], v[3] - v[0]
+    s0, s1 = c / n_div, (c + 1) / n_div
+    t0, t1 = r / n_div, (r + 1) / n_div
+
+    def P(s, t):
+        xy = v0 + e_s * s + e_t * t
+        return [xy[0], xy[1], z]
+
+    verts = np.array([P(s0, t0), P(s1, t0), P(s1, t1), P(s0, t1)], dtype=float)
+    tris = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    m = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(verts), o3d.utility.Vector3iVector(tris)
+    )
+    m.paint_uniform_color(list(color))
+    m.compute_vertex_normals()
+    return m
+
+
+def build_last_grid(hit_threshold=GRID_HIT_THRESHOLD, path=None):
+    """Carga el último cellMap_*.npz y devuelve la lista de geometrías Open3D del
+    grid: la malla (líneas) y un cuadrado por cada celda ocupada. Vacía si no hay."""
+    if path is None:
+        files = sorted(glob.glob("cellMap_*.npz"))
+        if not files:
+            print("[grid] No hay ningún cellMap_*.npz que mostrar")
+            return []
+        path = files[-1]
+    d = np.load(path, allow_pickle=True)
+    occ = np.asarray(d["occupancy"])
+    box = np.asarray(d["vertices"], dtype=float)
+    n_div = int(d["n_div"])
+    print(f"[grid] Mostrando {path}  ({n_div}x{n_div})")
+
+    geoms = []
+    grid = square_subdivision(box, n_lado=n_div - 1)
+    geoms.append(grid_lineset(grid, z=0.05, color=(0.4, 0.8, 1.0)))
+    for r, c in zip(*np.where(occ > hit_threshold)):
+        geoms.append(_cell_quad(box, n_div, r, c, z=0.02, color=(0.6, 0.2, 0.2)))
+    return geoms
+
+
 class State:
     def __init__(self):
         self.accumulated = o3d.geometry.PointCloud()
         self.pcd = o3d.geometry.PointCloud()
         self.show_points = True
         self.show_trajectory = True
+        self.show_grid = True
         self.points_added = False
         self.frames_since_voxel = 0
         self.traj_points = []
@@ -168,6 +218,11 @@ def main():
 
     s = State()
 
+    # Último grid extraído (malla + celdas ocupadas).
+    grid_geoms = build_last_grid()
+    for g in grid_geoms:
+        vis.add_geometry(g)
+
     def toggle_points(_v):
         s.show_points = not s.show_points
         if s.points_added:
@@ -197,12 +252,19 @@ def main():
             print(f"[guardado] mapa_{ts}.pcd  ({len(s.accumulated.points)} pts)")
         return False
 
+    def toggle_grid(_v):
+        s.show_grid = not s.show_grid
+        for g in grid_geoms:
+            (vis.add_geometry if s.show_grid else vis.remove_geometry)(g, reset_bounding_box=False)
+        return False
+
     vis.register_key_callback(ord("P"), toggle_points)
     vis.register_key_callback(ord("T"), toggle_traj)
     vis.register_key_callback(ord("C"), clear_map)
     vis.register_key_callback(ord("S"), save_map)
+    vis.register_key_callback(ord("G"), toggle_grid)
 
-    print("[teclas]  P: puntos   T: trayectoria   C: limpiar mapa   S: guardar")
+    print("[teclas]  P: puntos   T: trayectoria   C: limpiar mapa   S: guardar   G: grid")
 
     try:
         while True:

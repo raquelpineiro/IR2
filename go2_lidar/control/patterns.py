@@ -290,7 +290,7 @@ def _look_down_check(client, look_for_ball, settle_s=1.0):
 
 def autonomous_movement(client, odom, occupancy, vertices, n_div,
                         look_for_ball, hit_threshold=5, pause_s=0.4,
-                        cell_tolerance=0.15, settle_s=1.0):
+                        cell_tolerance=0.07, settle_s=1.0, min_v=0.12):
     """
     Recorre todas las casillas LIBRES de la rejilla buscando la pelota con la
     cámara.
@@ -302,8 +302,19 @@ def autonomous_movement(client, odom, occupancy, vertices, n_div,
          de la rejilla -> giro de 90°), baja la cámara con un `pitch` del cuerpo
          y llama a `look_for_ball()` para ver si la pelota está en esa casilla.
       3. Si la ve, se detiene y devuelve esa casilla (su posición en el grid).
-         Si no, entra en la casilla y sigue. Usa el grid (`_world_to_cell`) para
-         confirmar en qué casilla está en cada momento.
+         Si no, entra en la casilla y sigue.
+
+    Movimiento centrado en celdas (sin LiDAR todavía, ver más abajo):
+      - Cada paso a la casilla adyacente es un avance RELATIVO de exactamente
+        un "paso de rejilla" (la distancia entre centros de celda) hacia delante
+        en el frame del robot, no una navegación a una coordenada absoluta del
+        mundo. Así no arrastramos el error absoluto de la malla re-anclada.
+      - Al llegar se hace un CENTRADO FINO: se camina al destino con tolerancia
+        pequeña (`cell_tolerance`) y un `min_v` que evita que el robot se quede
+        atascado por la banda muerta del gait. Queda bien centrado en la casilla
+        antes de continuar.
+      Esto asume que los errores por paso son pequeños; cuando se integre el
+      LiDAR, la corrección de posición vendrá de ahí.
 
     `look_for_ball()` -> bool (la cámara ve verde, con el robot ya inclinado).
     Devuelve la casilla (fila, col) de la pelota, o None si no la encuentra.
@@ -319,6 +330,9 @@ def autonomous_movement(client, odom, occupancy, vertices, n_div,
     e_s, e_t = v[1] - v[0], v[3] - v[0]
     h_col = math.atan2(e_s[1], e_s[0])
     h_row = math.atan2(e_t[1], e_t[0])
+    # Paso de rejilla: distancia entre centros de celdas vecinas en cada eje.
+    pitch_col = float(np.linalg.norm(e_s)) / n_div
+    pitch_row = float(np.linalg.norm(e_t)) / n_div
 
     odom._wait_for_pose()
     odom._initial_frame()
@@ -327,17 +341,17 @@ def autonomous_movement(client, odom, occupancy, vertices, n_div,
         r, c = _world_to_cell(vertices, n_div, odom.t[:2])
         return (int(np.clip(r, 0, n_div - 1)), int(np.clip(c, 0, n_div - 1)))
 
-    def heading_to(a, b):
+    def step_to(a, b):
+        """Rumbo absoluto y distancia (un paso de celda) para ir de la casilla
+        `a` a la `b` adyacente."""
         drow, dcol = b[0] - a[0], b[1] - a[1]
         if dcol == 1:
-            h = h_col
-        elif dcol == -1:
-            h = h_col + math.pi
-        elif drow == 1:
-            h = h_row
-        else:
-            h = h_row + math.pi
-        return _wrap_pi(h)
+            return _wrap_pi(h_col), pitch_col
+        if dcol == -1:
+            return _wrap_pi(h_col + math.pi), pitch_col
+        if drow == 1:
+            return _wrap_pi(h_row), pitch_row
+        return _wrap_pi(h_row + math.pi), pitch_row
 
     # La casilla inicial es siempre la (0,0) (el robot arranca en su centro).
     start_cell = (0, 0) if free[0, 0] else _nearest_free(free, centers, odom.t[:2])
@@ -351,8 +365,9 @@ def autonomous_movement(client, odom, occupancy, vertices, n_div,
     checked = {start_cell}      # casillas ya miradas con la cámara
     for i in range(1, len(walk)):
         a, b = walk[i - 1], walk[i]
-        heading = heading_to(a, b)
-        print(f"[AUTO] {a} -> {b}  rumbo={math.degrees(heading):+.0f}°")
+        heading, pitch = step_to(a, b)
+        print(f"[AUTO] {a} -> {b}  rumbo={math.degrees(heading):+.0f}°  "
+              f"paso={pitch:.2f} m")
         _pivot_to_heading_precise(heading, client, odom, tag="paso")
 
         if b not in checked:
@@ -366,10 +381,16 @@ def autonomous_movement(client, odom, occupancy, vertices, n_div,
                 print(f"[AUTO] ¡Pelota detectada en la casilla {b}!")
                 return b
             _ensure_walk(client)        # tras el StandUp, volver a marcha
+            # El StandDown/StandUp puede haber desviado el rumbo: re-encarar.
+            _pivot_to_heading_precise(heading, client, odom, tag="reencarar")
 
-        # Entrar en la casilla y confirmar con el grid.
-        wx, wy = centers[b]
-        _walk_to(wx, wy, client, odom, tolerance=cell_tolerance)
+        # Avance RELATIVO de exactamente una celda hacia delante (frame del
+        # robot) + centrado fino al llegar. El destino es la posición actual
+        # desplazada `pitch` metros en el rumbo del eje de la rejilla.
+        cur_x, cur_y = float(odom.t[0]), float(odom.t[1])
+        wx = cur_x + pitch * math.cos(heading)
+        wy = cur_y + pitch * math.sin(heading)
+        _walk_to(wx, wy, client, odom, tolerance=cell_tolerance, min_v=min_v)
         _hold(client, pause_s)
         here = cur_cell()
         print(f"[AUTO] En casilla {here}" +

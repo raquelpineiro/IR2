@@ -176,7 +176,7 @@ def _cell_quad(box, n_div, r, c, z=0.05, color=(0.1, 0.9, 0.1)):
         return [xy[0], xy[1], z]
 
     verts = np.array([P(s0, t0), P(s1, t0), P(s1, t1), P(s0, t1)], dtype=float)
-    tris = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    tris = np.array([[0, 2, 1], [0, 3, 4]], dtype=np.int32)
     m = o3d.geometry.TriangleMesh(
         o3d.utility.Vector3dVector(verts), o3d.utility.Vector3iVector(tris)
     )
@@ -226,7 +226,7 @@ def visualize(odom, lidar, search, box, n_div, baseline_occupied, cloud_lock,
 
     # Celdas ocupadas del mapa base (rojo tenue).
     for (r, c) in zip(*np.where(baseline_occupied)):
-        vis.add_geometry(_cell_quad(box, n_div, r, c, z=0.02, color=(0.5, 0.15, 0.15)))
+        vis.add_geometry(_cell_quad(box, n_div, r, c, z=0.049, color=(0.5, 0.15, 0.15)))
 
     pcd = o3d.geometry.PointCloud()
     accumulated = o3d.geometry.PointCloud()
@@ -240,7 +240,7 @@ def visualize(odom, lidar, search, box, n_div, baseline_occupied, cloud_lock,
         nonlocal ball_added
         if search.ball_cell is not None and not ball_added:
             r, c = search.ball_cell
-            vis.add_geometry(_cell_quad(box, n_div, r, c, z=0.08, color=(0.1, 0.9, 0.1)),
+            vis.add_geometry(_cell_quad(box, n_div, r, c, z=0.049, color=(0.1, 0.9, 0.1)),
                              reset_bounding_box=False)
             ball_added = True
             print(f"[VIZ] Pelota pintada en la celda (fila={r}, col={c})")
