@@ -34,7 +34,9 @@ from unitree_sdk2py.go2.video.video_client import VideoClient
 from go2_lidar.odom import OdomTracker
 from go2_lidar.transforms import _robot_to_world, _world_to_robot
 from go2_lidar.mapping.get_cloudpoint import Custom
-from go2_lidar.control.patterns import autonomous_movement
+from go2_lidar.control.patterns import (
+    autonomous_movement, _cell_centers_world, _world_to_cell,
+)
 from go2_lidar.mapping.accumulator import (
     colorize_by_z, square_subdivision, grid_lineset, constructCellMap,
 )
@@ -48,6 +50,8 @@ GREEN_MIN_AREA = 500         # área mínima (px) del blob verde para darlo por 
 
 VOXEL_SIZE = 0.04
 DOWNSAMPLE_EVERY = 10
+
+CAMERA_PERIOD = 1.0          # cada cuántos segundos refrescar la ventana de cámara
 
 
 class Search:
@@ -81,22 +85,38 @@ def load_baseline(path=None):
     return occ, box, n_div, z_range, origin
 
 
-def reanchor_box(box_abs, map_origin, cur_origin):
+def reanchor_box(box_abs, map_origin, cur_origin, n_div):
     """Re-ancla la malla al frame actual del robot.
 
     Lleva los vértices del frame absoluto de la sesión de mapeo a un frame
     relativo al arranque de aquella sesión (restando `map_origin`) y de ahí al
-    frame del mundo de la sesión actual (con `cur_origin`). Asume que el robot
-    arranca físicamente en el mismo punto/orientación que cuando se mapeó.
+    frame del mundo de la sesión actual (con `cur_origin`).
+
+    Además desplaza la malla media celda: la esquina donde arrancó el mapeo se
+    sustituye por el CENTRO de esa primera casilla, de modo que el robot deba
+    colocarse en el centro de la primera casilla (no sobre el vértice de la
+    esquina) para que el mapa quede alineado.
+
+    Devuelve (box_cur, start_cell).
     """
     mx, my, myaw = map_origin
     cx, cy, cyaw = cur_origin
-    out = []
-    for wx, wy in box_abs:
-        rx, ry = _world_to_robot(wx, wy, mx, my, myaw)   # absoluto-mapeo -> relativo-arranque
-        nx, ny = _robot_to_world(rx, ry, cx, cy, cyaw)   # relativo-arranque -> mundo-actual
-        out.append([nx, ny])
-    return np.asarray(out, dtype=float)
+
+    # 1) Vértices en el frame relativo al arranque del mapeo.
+    box_rel = np.array([_world_to_robot(wx, wy, mx, my, myaw) for wx, wy in box_abs],
+                       dtype=float)
+
+    # 2) Casilla donde arrancó el robot (rel = (0,0)) y su centro -> al origen.
+    r0, c0 = _world_to_cell(box_rel, n_div, (0.0, 0.0))
+    r0 = int(np.clip(r0, 0, n_div - 1))
+    c0 = int(np.clip(c0, 0, n_div - 1))
+    centers_rel = _cell_centers_world(box_rel, n_div)
+    box_rel = box_rel - centers_rel[r0, c0]
+
+    # 3) Del frame relativo al mundo actual.
+    box_cur = np.array([_robot_to_world(rx, ry, cx, cy, cyaw) for rx, ry in box_rel],
+                       dtype=float)
+    return box_cur, (r0, c0)
 
 
 # --------------------------------------------------------------------------- #
@@ -120,7 +140,7 @@ def _sees_green(video):
 
 
 def make_detector(lidar, video, baseline_occupied, box, n_div, z_range,
-                  search, cloud_lock, hit_threshold=HIT_THRESHOLD):
+                  search, cloud_lock, video_lock, hit_threshold=HIT_THRESHOLD):
     """
     Devuelve check_ball() -> (fila, col) | None.
 
@@ -130,7 +150,9 @@ def make_detector(lidar, video, baseline_occupied, box, n_div, z_range,
     z_min, z_max = z_range
 
     def check_ball():
-        if not _sees_green(video):
+        with video_lock:
+            green = _sees_green(video)
+        if not green:
             return None
 
         with cloud_lock:
@@ -181,7 +203,27 @@ def _cell_quad(box, n_div, r, c, z=0.05, color=(0.1, 0.9, 0.1)):
     return m
 
 
-def visualize(odom, lidar, search, box, n_div, baseline_occupied, cloud_lock):
+def _show_camera(video, video_lock):
+    """Captura un fotograma y lo muestra en una ventana OpenCV, resaltando el
+    verde detectado. No bloquea: si no hay imagen, simplemente no actualiza."""
+    with video_lock:
+        code, data = video.GetImageSample()
+    if code != 0 or not data:
+        return
+    img = cv2.imdecode(np.frombuffer(bytes(data), dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, GREEN_LO, GREEN_HI)
+    green = np.zeros_like(img)
+    green[mask > 0] = (0, 255, 0)
+    view = cv2.addWeighted(img, 0.75, green, 0.25, 0)
+    cv2.imshow("Camara Go2 (verde resaltado)", view)
+    cv2.waitKey(1)
+
+
+def visualize(odom, lidar, search, box, n_div, baseline_occupied, cloud_lock,
+              video, video_lock):
     vis = o3d.visualization.VisualizerWithKeyCallback()
     vis.create_window(window_name="Go2 - Buscar pelota", width=1280, height=720)
 
@@ -210,6 +252,7 @@ def visualize(odom, lidar, search, box, n_div, baseline_occupied, cloud_lock):
     points_added = False
     ball_added = False
     frames = 0
+    last_cam = 0.0
 
     def paint_ball():
         nonlocal ball_added
@@ -249,6 +292,12 @@ def visualize(odom, lidar, search, box, n_div, baseline_occupied, cloud_lock):
 
         paint_ball()
 
+        # Refrescar la ventana de cámara cada CAMERA_PERIOD segundos.
+        now = time.time()
+        if now - last_cam > CAMERA_PERIOD:
+            last_cam = now
+            _show_camera(video, video_lock)
+
         if not vis.poll_events():
             break
         vis.update_renderer()
@@ -258,11 +307,16 @@ def visualize(odom, lidar, search, box, n_div, baseline_occupied, cloud_lock):
     # Búsqueda terminada: asegurar que la pelota queda pintada y mantener ventana.
     paint_ball()
     while True:
+        now = time.time()
+        if now - last_cam > CAMERA_PERIOD:
+            last_cam = now
+            _show_camera(video, video_lock)
         if not vis.poll_events():
             break
         vis.update_renderer()
         time.sleep(0.02)
     vis.destroy_window()
+    cv2.destroyAllWindows()
 
 
 # --------------------------------------------------------------------------- #
@@ -299,8 +353,12 @@ def main():
 
     # Re-anclar la malla al frame actual: el robot debe arrancar físicamente en
     # el mismo punto/orientación que cuando se mapeó (el "(0,0)" del mapa).
+    # OJO: _wait_for_pose() solo espera a has_pose; hay que bombear odom.update()
+    # nosotros mismos porque aún no corre ningún otro hilo que lo haga.
     print("[INIT] Esperando pose para fijar el frame de arranque...")
-    odom._wait_for_pose()
+    while not odom.has_pose:
+        odom.update()
+        time.sleep(0.02)
     cur_origin = odom._initial_frame()
     if map_origin is None:
         print("[INIT] AVISO: el mapa no contiene 'origin' (mapa antiguo). "
@@ -308,15 +366,17 @@ def main():
               "para alinear correctamente.")
         box = box_abs
     else:
-        box = reanchor_box(box_abs, map_origin, cur_origin)
-        print(f"[INIT] Malla re-anclada. origin_mapeo={map_origin} "
+        box, start_cell = reanchor_box(box_abs, map_origin, cur_origin, n_div)
+        print(f"[INIT] Malla re-anclada: primera casilla {start_cell} centrada "
+              f"en la pose actual. origin_mapeo={map_origin} "
               f"origin_actual={tuple(round(v, 3) for v in cur_origin)}")
 
     search = Search()
     cloud_lock = threading.Lock()
+    video_lock = threading.Lock()
 
     check_ball = make_detector(lidar, video, baseline_occupied, box, n_div,
-                               z_range, search, cloud_lock,
+                               z_range, search, cloud_lock, video_lock,
                                hit_threshold=HIT_THRESHOLD)
 
     def run_search():
@@ -331,7 +391,8 @@ def main():
     nav_thread = threading.Thread(target=run_search, daemon=True)
     nav_thread.start()
 
-    visualize(odom, lidar, search, box, n_div, baseline_occupied, cloud_lock)
+    visualize(odom, lidar, search, box, n_div, baseline_occupied, cloud_lock,
+              video, video_lock)
 
     if search.ball_cell is not None:
         r, c = search.ball_cell
