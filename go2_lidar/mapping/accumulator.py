@@ -95,10 +95,11 @@ def clean_box_from_trajectory(traj_xy, origin, margin=BOX_MARGIN):
     ARRANQUE: así esa esquina es la celda (0,0) y los giros entre celdas salen de
     90°.
 
-    `margin` (m) amplía el cuadrado hacia fuera por los 4 lados: la trayectoria
-    es el camino del CENTRO del robot, así que el AABB se queda corto respecto al
-    área que el robot realmente ocupa; ampliándolo se incluyen las casillas por
-    las que pasa y su arranque queda holgadamente dentro de la celda (0,0).
+    `margin` (m) amplía el cuadrado hacia fuera por los 4 lados. No modela que el
+    LiDAR vaya adelantado respecto al cuerpo: lo que se busca es centrar el ROBOT
+    COMPLETO en sus casillas (vía su pose, tal cual). La ampliación solo da
+    holgura para que el arranque quede holgadamente dentro de la celda (0,0) y la
+    malla cubra un poco más allá del recorrido.
 
     Si no hay `origin`, cae al minAreaRect de siempre (también ampliado).
     """

@@ -176,7 +176,7 @@ def _cell_quad(box, n_div, r, c, z=0.05, color=(0.1, 0.9, 0.1)):
         return [xy[0], xy[1], z]
 
     verts = np.array([P(s0, t0), P(s1, t0), P(s1, t1), P(s0, t1)], dtype=float)
-    tris = np.array([[0, 2, 1], [0, 3, 4]], dtype=np.int32)
+    tris = np.array([[0, 1, 2], [0, 2, 3], [0, 2, 1], [0, 3, 2]], dtype=np.int32)
     m = o3d.geometry.TriangleMesh(
         o3d.utility.Vector3dVector(verts), o3d.utility.Vector3iVector(tris)
     )
