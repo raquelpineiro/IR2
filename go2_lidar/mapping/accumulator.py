@@ -4,6 +4,8 @@ import time
 import cv2
 import matplotlib.path as mpath
 
+from go2_lidar.transforms import get_yaw_from_rot
+
 OUTLIER_NB = 20
 OUTLIER_STD = 2.0
 NORMAL_RADIUS = 0.20
@@ -145,6 +147,7 @@ class State:
         self.frames_since_voxel = 0
         self.traj_points = []
         self.prev_robot_T = np.eye(4)
+        self.origin = None          # (x0, y0, yaw0) del robot al iniciar el mapeo
 
 def visualizator_start(odom, custom):    
 
@@ -218,6 +221,9 @@ def visualizator_start(odom, custom):
                 s.prev_robot_T = T_now
 
                 pos = odom.t.copy()
+                if s.origin is None:
+                    # Frame inicial del robot: ancla del mapa (el "(0,0)" físico)
+                    s.origin = np.array([pos[0], pos[1], get_yaw_from_rot(odom.R)], dtype=float)
                 if len(s.traj_points) == 0 or np.linalg.norm(pos - s.traj_points[-1]) > TRAJ_MIN_STEP:
                     s.traj_points.append(pos)
                     if len(s.traj_points) >= 2:
@@ -309,7 +315,8 @@ def visualizator_start(odom, custom):
                 "cell_j": cell_j,
             }
 
-            np.savez(f"cellMap_{int(time.time())}.npz", occupancy=occ, vertices=box, n_div=n_div,z_range=(0.15, 0.8))
+            origin = s.origin if s.origin is not None else np.zeros(3)
+            np.savez(f"cellMap_{int(time.time())}.npz", occupancy=occ, vertices=box, n_div=n_div,z_range=(0.15, 0.8), origin=origin)
 
             # d = np.load("cellMap_tiempo.npz")
             # occ = d["occupancy"]

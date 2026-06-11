@@ -32,6 +32,7 @@ from unitree_sdk2py.go2.sport.sport_client import SportClient
 from unitree_sdk2py.go2.video.video_client import VideoClient
 
 from go2_lidar.odom import OdomTracker
+from go2_lidar.transforms import _robot_to_world, _world_to_robot
 from go2_lidar.mapping.get_cloudpoint import Custom
 from go2_lidar.control.patterns import autonomous_movement
 from go2_lidar.mapping.accumulator import (
@@ -74,8 +75,28 @@ def load_baseline(path=None):
     box = np.asarray(d["vertices"], dtype=float)
     n_div = int(d["n_div"])
     z_range = tuple(float(z) for z in d["z_range"])
-    print(f"[MAP] Cargado {path}  (rejilla {n_div}x{n_div}, z={z_range})")
-    return occ, box, n_div, z_range
+    origin = np.asarray(d["origin"], dtype=float) if "origin" in d.files else None
+    print(f"[MAP] Cargado {path}  (rejilla {n_div}x{n_div}, z={z_range}, "
+          f"origin={origin})")
+    return occ, box, n_div, z_range, origin
+
+
+def reanchor_box(box_abs, map_origin, cur_origin):
+    """Re-ancla la malla al frame actual del robot.
+
+    Lleva los vértices del frame absoluto de la sesión de mapeo a un frame
+    relativo al arranque de aquella sesión (restando `map_origin`) y de ahí al
+    frame del mundo de la sesión actual (con `cur_origin`). Asume que el robot
+    arranca físicamente en el mismo punto/orientación que cuando se mapeó.
+    """
+    mx, my, myaw = map_origin
+    cx, cy, cyaw = cur_origin
+    out = []
+    for wx, wy in box_abs:
+        rx, ry = _world_to_robot(wx, wy, mx, my, myaw)   # absoluto-mapeo -> relativo-arranque
+        nx, ny = _robot_to_world(rx, ry, cx, cy, cyaw)   # relativo-arranque -> mundo-actual
+        out.append([nx, ny])
+    return np.asarray(out, dtype=float)
 
 
 # --------------------------------------------------------------------------- #
@@ -262,7 +283,7 @@ def main():
     else:
         ChannelFactoryInitialize(0)
 
-    occ, box, n_div, z_range = load_baseline(map_path)
+    occ, box_abs, n_div, z_range, map_origin = load_baseline(map_path)
     baseline_occupied = occ > HIT_THRESHOLD
 
     lidar = Custom(TOPIC_CLOUD)
@@ -275,6 +296,21 @@ def main():
     video = VideoClient()
     video.SetTimeout(3.0)
     video.Init()
+
+    # Re-anclar la malla al frame actual: el robot debe arrancar físicamente en
+    # el mismo punto/orientación que cuando se mapeó (el "(0,0)" del mapa).
+    print("[INIT] Esperando pose para fijar el frame de arranque...")
+    odom._wait_for_pose()
+    cur_origin = odom._initial_frame()
+    if map_origin is None:
+        print("[INIT] AVISO: el mapa no contiene 'origin' (mapa antiguo). "
+              "Se usa en frame absoluto; vuelve a ejecutar navegacion_manual.py "
+              "para alinear correctamente.")
+        box = box_abs
+    else:
+        box = reanchor_box(box_abs, map_origin, cur_origin)
+        print(f"[INIT] Malla re-anclada. origin_mapeo={map_origin} "
+              f"origin_actual={tuple(round(v, 3) for v in cur_origin)}")
 
     search = Search()
     cloud_lock = threading.Lock()

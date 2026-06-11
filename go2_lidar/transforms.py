@@ -25,3 +25,11 @@ def _robot_to_world(rx, ry, x0, y0, yaw0):
     """Transforma (rx, ry) del frame del robot inicial al frame del mundo."""
     c0, s0 = math.cos(yaw0), math.sin(yaw0)
     return x0 + c0 * rx - s0 * ry, y0 + s0 * rx + c0 * ry
+
+
+def _world_to_robot(wx, wy, x0, y0, yaw0):
+    """Inversa de _robot_to_world: lleva (wx, wy) del mundo al frame inicial
+    del robot (origen en (x0, y0), eje +X según yaw0)."""
+    c0, s0 = math.cos(yaw0), math.sin(yaw0)
+    dx, dy = wx - x0, wy - y0
+    return c0 * dx + s0 * dy, -s0 * dx + c0 * dy
