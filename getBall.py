@@ -54,7 +54,6 @@ VOXEL_SIZE = 0.04
 DOWNSAMPLE_EVERY = 10
 
 CAMERA_PERIOD = 1.0          # cada cuántos segundos refrescar la ventana de cámara
-CAMERA_PITCH = 0.5           # pitch del cuerpo (rad) al acercarse, para mirar al suelo
 
 
 class Search:
@@ -364,7 +363,7 @@ def main():
         try:
             cell = autonomous_movement(
                 client, odom, occ, box, n_div, look_for_ball,
-                hit_threshold=HIT_THRESHOLD, camera_pitch=CAMERA_PITCH,
+                hit_threshold=HIT_THRESHOLD,
             )
             if cell is not None:
                 search.ball_cell = cell

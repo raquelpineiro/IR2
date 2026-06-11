@@ -259,31 +259,38 @@ def _ensure_walk(client, warmup_s=0.6):
         time.sleep(0.05)
 
 
-def _look_down(client, pitch, settle_s=0.6):
-    """Inclina el cuerpo (morro abajo) para que la cámara apunte al suelo/objeto.
-    La cámara del Go2 es fija; la única forma de bajar su mirada es el pitch del
-    cuerpo vía Euler() en modo BalanceStand."""
+def _look_down_check(client, look_for_ball, settle_s=1.0):
+    """Agacha al robot (StandDown) para bajar la cámara hacia el suelo, mira con
+    la cámara si está la pelota y se vuelve a levantar (StandUp).
+
+    La cámara del Go2 es fija en la cabeza; al agacharse, su punto de vista baja
+    y se puede ver mejor un objeto bajo (la pelota) en la casilla de delante.
+    Devuelve True si `look_for_ball()` ve la pelota. Es defensivo: si el cliente
+    no tiene StandDown/StandUp, simplemente mira desde de pie.
+    """
     client.StopMove()
+    can_down = hasattr(client, "StandDown")
+    can_up = hasattr(client, "StandUp")
+    if not can_down:
+        print("[AUTO] AVISO: SportClient no expone StandDown(); miro desde de pie")
+
+    if can_down:
+        client.StandDown()
+        time.sleep(settle_s)        # agacharse y estabilizar
+
+    found = look_for_ball()
+
+    if can_down and can_up:
+        client.StandUp()
+        time.sleep(settle_s)        # levantarse antes de seguir
     client.BalanceStand()
     time.sleep(0.3)
-    if hasattr(client, "Euler"):
-        client.Euler(0.0, float(pitch), 0.0)
-    else:
-        print("[AUTO] AVISO: SportClient no expone Euler(); no puedo inclinar la cámara")
-    time.sleep(settle_s)
-
-
-def _look_level(client, settle_s=0.3):
-    """Devuelve el cuerpo a la horizontal."""
-    if hasattr(client, "Euler"):
-        client.Euler(0.0, 0.0, 0.0)
-    client.BalanceStand()
-    time.sleep(settle_s)
+    return found
 
 
 def autonomous_movement(client, odom, occupancy, vertices, n_div,
                         look_for_ball, hit_threshold=5, pause_s=0.4,
-                        cell_tolerance=0.08, camera_pitch=0.5, settle_s=0.6):
+                        cell_tolerance=0.15, settle_s=1.0):
     """
     Recorre todas las casillas LIBRES de la rejilla buscando la pelota con la
     cámara.
@@ -349,17 +356,16 @@ def autonomous_movement(client, odom, occupancy, vertices, n_div,
         _pivot_to_heading_precise(heading, client, odom, tag="paso")
 
         if b not in checked:
-            # Antes de entrar: pitch y mirar si la pelota está en esa casilla.
-            print(f"[AUTO] Mirando la casilla {b} (pitch)...")
-            _look_down(client, camera_pitch, settle_s)
-            found = look_for_ball()
-            _look_level(client)
+            # Antes de entrar: agacharse (StandDown) y mirar si la pelota está
+            # en esa casilla.
+            print(f"[AUTO] Mirando la casilla {b} (StandDown)...")
+            found = _look_down_check(client, look_for_ball, settle_s=settle_s)
             checked.add(b)
             if found:
                 client.StopMove()
                 print(f"[AUTO] ¡Pelota detectada en la casilla {b}!")
                 return b
-            _ensure_walk(client)        # tras el BalanceStand, volver a marcha
+            _ensure_walk(client)        # tras el StandUp, volver a marcha
 
         # Entrar en la casilla y confirmar con el grid.
         wx, wy = centers[b]
