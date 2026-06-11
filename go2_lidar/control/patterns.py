@@ -12,7 +12,7 @@ from go2_lidar.control.primitives import (
 )
 
 def do_square(client, odom, step=0.65, stops_per_side=5, pause_s=1.0,
-              clockwise=False, tolerance=0.165, lidar=None, hit_threshold=5):
+              clockwise=False, tolerance=0.165, lidar=None, hit_threshold=20):
     """
     Recorre un cuadrado en el plano del suelo deteniéndose cada `step` metros.
     Cada lado tiene `stops_per_side` paradas (incluyendo la esquina final),
@@ -289,8 +289,9 @@ def _look_down_check(client, look_for_ball, settle_s=1.0):
 
 
 def autonomous_movement(client, odom, occupancy, vertices, n_div,
-                        look_for_ball, hit_threshold=5, pause_s=0.4,
-                        cell_tolerance=0.07, settle_s=1.0, min_v=0.12):
+                        look_for_ball, locate_ball=None, hit_threshold=5,
+                        pause_s=0.4, cell_tolerance=0.07, settle_s=1.0,
+                        min_v=0.12):
     """
     Recorre todas las casillas LIBRES de la rejilla buscando la pelota con la
     cámara.
@@ -378,8 +379,17 @@ def autonomous_movement(client, odom, occupancy, vertices, n_div,
             checked.add(b)
             if found:
                 client.StopMove()
-                print(f"[AUTO] ¡Pelota detectada en la casilla {b}!")
-                return b
+                # La cámara ve verde en esta dirección, pero puede estar a 2+
+                # casillas: el LiDAR localiza la celda real recorriendo la línea
+                # del grid hacia delante. Si no la ve, se queda con la de delante.
+                ball = b
+                if locate_ball is not None:
+                    direction = (b[0] - a[0], b[1] - a[1])
+                    loc = locate_ball(a, direction)
+                    if loc is not None:
+                        ball = loc
+                print(f"[AUTO] ¡Pelota detectada en la casilla {ball}!")
+                return ball
             _ensure_walk(client)        # tras el StandUp, volver a marcha
             # El StandDown/StandUp puede haber desviado el rumbo: re-encarar.
             _pivot_to_heading_precise(heading, client, odom, tag="reencarar")

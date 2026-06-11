@@ -40,12 +40,15 @@ from go2_lidar.control.patterns import (
     autonomous_movement, _cell_centers_world, _world_to_cell,
 )
 from go2_lidar.mapping.accumulator import (
-    colorize_by_z, square_subdivision, grid_lineset,
+    colorize_by_z, square_subdivision, grid_lineset, constructCellMap,
 )
 
 TOPIC_CLOUD = "rt/utlidar/cloud_deskewed"
 
-HIT_THRESHOLD = 5            # conteo de puntos por celda para considerarla ocupada
+HIT_THRESHOLD = 20            # conteo de puntos por celda para considerarla ocupada
+# Banda de altura para LOCALIZAR la pelota con el LiDAR (objeto bajo): por debajo
+# del rango del mapeo (z=0.15-0.8, para paredes). Ajusta según el tamaño real.
+BALL_Z_RANGE = (0.03, 0.35)
 GREEN_LO = np.array([35, 70, 50], dtype=np.uint8)    # verde en HSV (OpenCV: H 0-179)
 GREEN_HI = np.array([85, 255, 255], dtype=np.uint8)
 GREEN_MIN_AREA = 500         # área mínima (px) del blob verde para darlo por válido
@@ -159,6 +162,44 @@ def make_look_for_ball(video, video_lock, n_frames=4, settle=0.12):
         return False
 
     return look_for_ball
+
+
+def make_locate_ball(lidar, baseline_occupied, box, n_div, z_range, cloud_lock,
+                     hit_threshold=HIT_THRESHOLD):
+    """
+    Devuelve locate_ball(from_cell, direction) -> celda (fila, col) | None.
+
+    Cuando la cámara ya confirmó verde en una dirección, el LiDAR localiza la
+    casilla real: construye la ocupación actual (con z baja, para objetos bajos),
+    marca las celdas que estaban LIBRES y ahora están ocupadas (objeto nuevo) y
+    recorre la línea del grid desde `from_cell` en `direction`, devolviendo la
+    PRIMERA celda nueva-ocupada. Así la pelota se atribuye a su casilla real
+    aunque esté 2+ casillas por delante. None si el LiDAR no ve nada en esa línea.
+    """
+    z_min, z_max = z_range
+
+    def locate_ball(from_cell, direction):
+        with cloud_lock:
+            data = lidar.get_cloud()
+        if data is None or len(data["xyz"]) == 0:
+            return None
+        xyz = data["xyz"].astype(np.float64, copy=False)
+        cur = constructCellMap(xyz, box, n_div, z_min=z_min, z_max=z_max)
+        new_occ = (cur > hit_threshold) & (~baseline_occupied)
+
+        r, c = from_cell
+        dr, dc = direction
+        r += dr
+        c += dc
+        while 0 <= r < n_div and 0 <= c < n_div:
+            if new_occ[r, c]:
+                print(f"[DET] LiDAR localiza objeto nuevo en {(int(r), int(c))}")
+                return (int(r), int(c))
+            r += dr
+            c += dc
+        return None
+
+    return locate_ball
 
 
 # --------------------------------------------------------------------------- #
@@ -358,12 +399,15 @@ def main():
     video_lock = threading.Lock()
 
     look_for_ball = make_look_for_ball(video, video_lock)
+    locate_ball = make_locate_ball(lidar, baseline_occupied, box, n_div,
+                                   BALL_Z_RANGE, cloud_lock,
+                                   hit_threshold=HIT_THRESHOLD)
 
     def run_search():
         try:
             cell = autonomous_movement(
                 client, odom, occ, box, n_div, look_for_ball,
-                hit_threshold=HIT_THRESHOLD,
+                locate_ball=locate_ball, hit_threshold=HIT_THRESHOLD,
             )
             if cell is not None:
                 search.ball_cell = cell
