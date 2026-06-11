@@ -282,36 +282,32 @@ def _look_level(client, settle_s=0.3):
 
 
 def autonomous_movement(client, odom, occupancy, vertices, n_div,
-                        detect_new_cells, confirm_ball,
-                        hit_threshold=5, pause_s=0.5, cell_tolerance=0.08,
-                        camera_pitch=0.5, settle_s=0.6, explore=True):
+                        look_for_ball, hit_threshold=5, pause_s=0.4,
+                        cell_tolerance=0.08, camera_pitch=0.5, settle_s=0.6):
     """
-    Busca un objeto nuevo (la pelota) sobre la rejilla de ocupación.
+    Recorre todas las casillas LIBRES de la rejilla buscando la pelota con la
+    cámara.
 
     Estrategia:
-      1. `detect_new_cells()` (LiDAR) devuelve las celdas que estaban LIBRES en
-         el mapa base y ahora aparecen ocupadas: candidatas a objeto nuevo.
-      2. El robot navega hasta una casilla libre CONTIGUA al candidato más
-         cercano (BFS 4-conexo), evitando tanto las celdas ocupadas del mapa
-         base como las nuevas (no choca con el objeto).
-      3. Encara el candidato, baja la cámara con un `pitch` del cuerpo y llama a
-         `confirm_ball()` (cámara) para ver si es verde.
-      4. Si lo confirma, se detiene y devuelve la celda (fila, col). Si no, la
-         descarta y sigue. Si no hay candidatos visibles y `explore=True`, se
-         mueve por celdas libres para ganar visión.
+      1. Planifica un recorrido 4-conexo que entra en cada casilla libre (DFS
+         con backtracking: cada salto es a una casilla adyacente).
+      2. Antes de ENTRAR en cada casilla nueva, la encara (rumbo exacto del eje
+         de la rejilla -> giro de 90°), baja la cámara con un `pitch` del cuerpo
+         y llama a `look_for_ball()` para ver si la pelota está en esa casilla.
+      3. Si la ve, se detiene y devuelve esa casilla (su posición en el grid).
+         Si no, entra en la casilla y sigue. Usa el grid (`_world_to_cell`) para
+         confirmar en qué casilla está en cada momento.
 
-    `detect_new_cells()` -> lista de celdas (fila, col).
-    `confirm_ball()` -> bool.
-    Devuelve la celda de la pelota, o None si no la encuentra.
+    `look_for_ball()` -> bool (la cámara ve verde, con el robot ya inclinado).
+    Devuelve la casilla (fila, col) de la pelota, o None si no la encuentra.
     """
     occupancy = np.asarray(occupancy)
     free = ~(occupancy > hit_threshold)
     centers = _cell_centers_world(vertices, n_div)
 
-    # Rumbos ABSOLUTOS de los ejes de la rejilla (en el mundo): +columna sigue
-    # la arista e_s = v1-v0 y +fila la arista e_t = v3-v0. Como la malla está
-    # re-anclada al heading del robot, moverse entre celdas perpendiculares es un
-    # giro exacto de 90° y el paso es justo una casilla.
+    # Rumbos ABSOLUTOS de los ejes de la rejilla: +columna sigue e_s = v1-v0 y
+    # +fila sigue e_t = v3-v0. Como la malla está re-anclada al heading del
+    # robot, ir entre casillas perpendiculares es un giro exacto de 90°.
     v = np.asarray(vertices, dtype=float)
     e_s, e_t = v[1] - v[0], v[3] - v[0]
     h_col = math.atan2(e_s[1], e_s[0])
@@ -322,117 +318,57 @@ def autonomous_movement(client, odom, occupancy, vertices, n_div,
 
     def cur_cell():
         r, c = _world_to_cell(vertices, n_div, odom.t[:2])
-        r = int(np.clip(r, 0, n_div - 1))
-        c = int(np.clip(c, 0, n_div - 1))
-        if not free[r, c]:
-            r, c = _nearest_free(free, centers, odom.t[:2])
-        return (r, c)
+        return (int(np.clip(r, 0, n_div - 1)), int(np.clip(c, 0, n_div - 1)))
 
-    def walk_path(path):
-        """Camina por las celdas de `path` (la primera es la actual), pivotando
-        al rumbo EXACTO del eje de la rejilla en cada salto."""
-        for i in range(1, len(path)):
-            pr, pc = path[i - 1]
-            r, c = path[i]
-            drow, dcol = r - pr, c - pc
-            if dcol == 1:
-                heading = h_col
-            elif dcol == -1:
-                heading = h_col + math.pi
-            elif drow == 1:
-                heading = h_row
-            else:
-                heading = h_row + math.pi
-            wx, wy = centers[r, c]
-            print(f"[AUTO] -> celda ({r},{c})  rumbo={math.degrees(_wrap_pi(heading)):+.0f}°")
-            _pivot_to_heading_precise(_wrap_pi(heading), client, odom, tag="step")
-            _walk_to(wx, wy, client, odom, tolerance=cell_tolerance)
-            _hold(client, pause_s)
+    def heading_to(a, b):
+        drow, dcol = b[0] - a[0], b[1] - a[1]
+        if dcol == 1:
+            h = h_col
+        elif dcol == -1:
+            h = h_col + math.pi
+        elif drow == 1:
+            h = h_row
+        else:
+            h = h_row + math.pi
+        return _wrap_pi(h)
 
     # La casilla inicial es siempre la (0,0) (el robot arranca en su centro).
-    start_cell = (0, 0) if free[0, 0] else cur_cell()
+    start_cell = (0, 0) if free[0, 0] else _nearest_free(free, centers, odom.t[:2])
+    walk = _coverage_walk(free, start_cell)
+    print(f"[AUTO] {int(free.sum())} celdas libres; recorrido de {len(walk)} "
+          f"pasos desde {start_cell}")
 
-    # Orden de exploración (fallback cuando no se ve ningún objeto nuevo).
-    explore_order = []
-    if explore:
-        seen = set()
-        for cell in _coverage_walk(free, start_cell):
-            if cell not in seen:
-                seen.add(cell)
-                explore_order.append(cell)
-    ei = 0
-
-    print(f"[AUTO] {int(free.sum())} celdas libres. BalanceStand + ClassicWalk")
+    print("[AUTO] BalanceStand + ClassicWalk")
     _ensure_walk(client, warmup_s=1.2)
 
-    checked = set()     # candidatos ya inspeccionados que NO eran la pelota
+    checked = {start_cell}      # casillas ya miradas con la cámara
+    for i in range(1, len(walk)):
+        a, b = walk[i - 1], walk[i]
+        heading = heading_to(a, b)
+        print(f"[AUTO] {a} -> {b}  rumbo={math.degrees(heading):+.0f}°")
+        _pivot_to_heading_precise(heading, client, odom, tag="paso")
 
-    while True:
-        new_cells = [tuple(int(v) for v in c) for c in detect_new_cells()]
-        new_set = {c for c in new_cells if 0 <= c[0] < n_div and 0 <= c[1] < n_div}
+        if b not in checked:
+            # Antes de entrar: pitch y mirar si la pelota está en esa casilla.
+            print(f"[AUTO] Mirando la casilla {b} (pitch)...")
+            _look_down(client, camera_pitch, settle_s)
+            found = look_for_ball()
+            _look_level(client)
+            checked.add(b)
+            if found:
+                client.StopMove()
+                print(f"[AUTO] ¡Pelota detectada en la casilla {b}!")
+                return b
+            _ensure_walk(client)        # tras el BalanceStand, volver a marcha
 
-        # Rejilla transitable: libres del mapa base MENOS los objetos nuevos.
-        nav_free = free.copy()
-        for (r, c) in new_set:
-            nav_free[r, c] = False
-        cur = cur_cell()
-        nav_free[cur] = True    # nunca bloquear la celda donde está el robot
+        # Entrar en la casilla y confirmar con el grid.
+        wx, wy = centers[b]
+        _walk_to(wx, wy, client, odom, tolerance=cell_tolerance)
+        _hold(client, pause_s)
+        here = cur_cell()
+        print(f"[AUTO] En casilla {here}" +
+              ("" if here == b else f"  (esperaba {b})"))
 
-        cands = [c for c in new_set if c not in checked]
-        if cands:
-            best, best_path = None, None
-            for cand in cands:
-                goals = _free_neighbors(nav_free, cand)
-                if not goals:
-                    checked.add(cand)       # rodeado de ocupadas: inalcanzable
-                    continue
-                p = _bfs_path(nav_free, cur, goals)
-                if p is not None and (best_path is None or len(p) < len(best_path)):
-                    best, best_path = cand, p
-
-            if best is not None:
-                print(f"[AUTO] Investigando celda nueva {best} "
-                      f"({len(best_path) - 1} pasos)")
-                _ensure_walk(client)
-                walk_path(best_path)
-
-                # Encarar el candidato desde la casilla contigua.
-                stand = best_path[-1]
-                sx, sy = centers[stand]
-                tx, ty = centers[best]
-                heading = math.atan2(ty - sy, tx - sx)
-                _pivot_to_heading_precise(_wrap_pi(heading), client, odom, tag="face")
-                _hold(client, 0.3)
-
-                # Bajar la cámara (pitch) y confirmar con la cámara.
-                _look_down(client, camera_pitch, settle_s)
-                found = confirm_ball()
-                _look_level(client)
-
-                if found:
-                    client.StopMove()
-                    print(f"[AUTO] ¡Pelota confirmada en la celda {best}!")
-                    return best
-
-                print(f"[AUTO] La celda {best} no es la pelota; descartada")
-                checked.add(best)
-                continue        # re-detectar desde la nueva posición
-
-        # Sin candidatos accionables: explorar para ganar visión.
-        moved = False
-        while ei < len(explore_order):
-            tgt = explore_order[ei]
-            ei += 1
-            if tgt == cur or not nav_free[tgt]:
-                continue
-            p = _bfs_path(nav_free, cur, {tgt})
-            if p is not None and len(p) > 1:
-                print(f"[AUTO] Explorando hacia {tgt}")
-                _ensure_walk(client)
-                walk_path(p)
-                moved = True
-                break
-        if not moved:
-            client.StopMove()
-            print("[AUTO] No hay objetos nuevos por confirmar ni zonas por explorar")
-            return None
+    client.StopMove()
+    print("[AUTO] Recorrido completado: no se encontró la pelota")
+    return None

@@ -1,15 +1,15 @@
 """
 Búsqueda autónoma de una pelota verde sobre la malla de ocupación.
 
-Usa la rejilla de ocupación generada por navegacion_manual.py (cellMap_*.npz):
+Usa la rejilla de ocupación generada por navegacion_manual.py (cellMap_*.npz)
+para recorrer todas las casillas LIBRES buscando la pelota con la cámara:
 
-  - LiDAR: detecta las celdas que estaban LIBRES en el mapa base y ahora
-    aparecen ocupadas (objetos nuevos).
-  - El robot navega hacia el objeto nuevo más cercano por celdas libres (BFS),
-    evitando tanto las celdas ocupadas del mapa base como las nuevas.
-  - Al llegar a una casilla contigua, inclina el cuerpo (pitch) para que la
-    cámara mire hacia el objeto y confirma con la cámara (VideoClient + HSV) si
-    es VERDE. Si lo es, devuelve su posición; si no, lo descarta y sigue.
+  - El robot recorre las casillas libres de casilla en casilla (movimientos
+    horizontales/verticales), usando el grid para saber en qué casilla está.
+  - Antes de ENTRAR en cada casilla nueva, la encara, inclina el cuerpo (pitch)
+    para que la cámara mire esa casilla y comprueba con la cámara (VideoClient +
+    HSV) si está la pelota (verde).
+  - Si la ve, se detiene y devuelve la posición (fila, col) de esa casilla.
 
 La visualización (Open3D) muestra la malla, los ejes, las celdas ocupadas del
 mapa base y, al encontrarla, pinta en verde la celda con la pelota. Además abre
@@ -40,17 +40,12 @@ from go2_lidar.control.patterns import (
     autonomous_movement, _cell_centers_world, _world_to_cell,
 )
 from go2_lidar.mapping.accumulator import (
-    colorize_by_z, square_subdivision, grid_lineset, constructCellMap,
+    colorize_by_z, square_subdivision, grid_lineset,
 )
 
 TOPIC_CLOUD = "rt/utlidar/cloud_deskewed"
 
 HIT_THRESHOLD = 5            # conteo de puntos por celda para considerarla ocupada
-# Banda de altura para DETECTAR la pelota (objeto bajo): por debajo del rango
-# del mapeo (z=0.15-0.8, pensado para paredes). z_min por encima del ruido del
-# suelo para no llenar la rejilla de falsos positivos; z_max donde acabe la
-# pelota. Bájalo/súbelo según el tamaño real de la pelota.
-BALL_Z_RANGE = (0.03, 0.35)
 GREEN_LO = np.array([35, 70, 50], dtype=np.uint8)    # verde en HSV (OpenCV: H 0-179)
 GREEN_HI = np.array([85, 255, 255], dtype=np.uint8)
 GREEN_MIN_AREA = 500         # área mínima (px) del blob verde para darlo por válido
@@ -128,7 +123,7 @@ def reanchor_box(box_abs, map_origin, cur_origin, n_div):
 
 
 # --------------------------------------------------------------------------- #
-# Detección: cámara (verde) + LiDAR (celda)
+# Detección por cámara (verde)
 # --------------------------------------------------------------------------- #
 def _sees_green(video):
     """True si la cámara frontal ve un blob verde suficientemente grande."""
@@ -147,50 +142,24 @@ def _sees_green(video):
     return max(cv2.contourArea(c) for c in cnts) >= GREEN_MIN_AREA
 
 
-def make_new_cell_detector(lidar, baseline_occupied, box, n_div, z_range,
-                           cloud_lock, hit_threshold=HIT_THRESHOLD):
+def make_look_for_ball(video, video_lock, n_frames=4, settle=0.12):
     """
-    Devuelve detect_new_cells() -> lista de celdas (fila, col).
+    Devuelve look_for_ball() -> bool.
 
-    Solo LiDAR: construye la ocupación actual y devuelve las celdas que estaban
-    LIBRES en el mapa base y ahora superan el umbral de puntos (objetos nuevos).
+    Con el robot ya inclinado (pitch) y encarando la casilla, captura varios
+    fotogramas y confirma si hay verde (la pelota) en alguno de ellos.
     """
-    z_min, z_max = z_range
-
-    def detect_new_cells():
-        with cloud_lock:
-            data = lidar.get_cloud()
-        if data is None or len(data["xyz"]) == 0:
-            return []
-        xyz = data["xyz"].astype(np.float64, copy=False)
-        current = constructCellMap(xyz, box, n_div, z_min=z_min, z_max=z_max)
-        new_occ = (current > hit_threshold) & (~baseline_occupied)
-        cells = [(int(r), int(c)) for r, c in zip(*np.where(new_occ))]
-        if cells:
-            print(f"[DET] Celdas nuevas ocupadas (LiDAR): {cells}")
-        return cells
-
-    return detect_new_cells
-
-
-def make_confirm_ball(video, video_lock, n_frames=4, settle=0.12):
-    """
-    Devuelve confirm_ball() -> bool.
-
-    Solo cámara: con el robot ya inclinado (pitch) hacia el objeto, captura
-    varios fotogramas y confirma si hay verde en alguno de ellos.
-    """
-    def confirm_ball():
+    def look_for_ball():
         for _ in range(n_frames):
             with video_lock:
                 green = _sees_green(video)
             if green:
-                print("[DET] Verde confirmado por la cámara")
+                print("[DET] Verde detectado por la cámara")
                 return True
             time.sleep(settle)
         return False
 
-    return confirm_ball
+    return look_for_ball
 
 
 # --------------------------------------------------------------------------- #
@@ -389,16 +358,12 @@ def main():
     cloud_lock = threading.Lock()
     video_lock = threading.Lock()
 
-    detect_new_cells = make_new_cell_detector(lidar, baseline_occupied, box,
-                                              n_div, BALL_Z_RANGE, cloud_lock,
-                                              hit_threshold=HIT_THRESHOLD)
-    confirm_ball = make_confirm_ball(video, video_lock)
+    look_for_ball = make_look_for_ball(video, video_lock)
 
     def run_search():
         try:
             cell = autonomous_movement(
-                client, odom, occ, box, n_div,
-                detect_new_cells, confirm_ball,
+                client, odom, occ, box, n_div, look_for_ball,
                 hit_threshold=HIT_THRESHOLD, camera_pitch=CAMERA_PITCH,
             )
             if cell is not None:
