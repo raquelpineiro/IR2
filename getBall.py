@@ -1,0 +1,311 @@
+"""
+Búsqueda autónoma de una pelota verde sobre la malla de ocupación.
+
+Usa la rejilla de ocupación generada por navegacion_manual.py (cellMap_*.npz):
+el robot recorre las celdas LIBRES moviéndose de casilla en casilla (solo en
+horizontal o vertical) y, en cada una, gira escaneando el entorno. La detección
+fusiona cámara y LiDAR:
+
+  - Cámara (VideoClient): confirma que hay VERDE en el campo de visión
+    (umbral en HSV con OpenCV).
+  - LiDAR: cuando hay verde, busca qué celda —antes libre— ha pasado a estar
+    ocupada respecto al mapa base. Esa celda es la posición de la pelota.
+
+La visualización (Open3D) muestra la malla, los ejes, las celdas ocupadas del
+mapa base y, al encontrarla, pinta en verde la celda con la pelota.
+
+Uso:
+    python getBall.py [interfaz_red] [ruta_cellMap.npz]
+"""
+
+import sys
+import glob
+import time
+import threading
+
+import numpy as np
+import cv2
+import open3d as o3d
+
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+from unitree_sdk2py.go2.sport.sport_client import SportClient
+from unitree_sdk2py.go2.video.video_client import VideoClient
+
+from go2_lidar.odom import OdomTracker
+from go2_lidar.mapping.get_cloudpoint import Custom
+from go2_lidar.control.patterns import autonomous_movement
+from go2_lidar.mapping.accumulator import (
+    colorize_by_z, square_subdivision, grid_lineset, constructCellMap,
+)
+
+TOPIC_CLOUD = "rt/utlidar/cloud_deskewed"
+
+HIT_THRESHOLD = 5            # conteo de puntos por celda para considerarla ocupada
+GREEN_LO = np.array([35, 70, 50], dtype=np.uint8)    # verde en HSV (OpenCV: H 0-179)
+GREEN_HI = np.array([85, 255, 255], dtype=np.uint8)
+GREEN_MIN_AREA = 500         # área mínima (px) del blob verde para darlo por válido
+
+VOXEL_SIZE = 0.04
+DOWNSAMPLE_EVERY = 10
+
+
+class Search:
+    """Estado compartido entre el hilo de movimiento y la visualización."""
+    def __init__(self):
+        self.end = False
+        self.ball_cell = None      # (fila, col) donde se detecta la pelota
+        self.ball_count = 0        # nº de puntos LiDAR en esa celda
+        self.result = None
+
+
+# --------------------------------------------------------------------------- #
+# Carga del mapa base
+# --------------------------------------------------------------------------- #
+def load_baseline(path=None):
+    if path is None:
+        files = sorted(glob.glob("cellMap_*.npz"))
+        if not files:
+            raise FileNotFoundError(
+                "No se encontró ningún cellMap_*.npz. Ejecuta antes navegacion_manual.py."
+            )
+        path = files[-1]
+    d = np.load(path, allow_pickle=True)
+    occ = np.asarray(d["occupancy"])
+    box = np.asarray(d["vertices"], dtype=float)
+    n_div = int(d["n_div"])
+    z_range = tuple(float(z) for z in d["z_range"])
+    print(f"[MAP] Cargado {path}  (rejilla {n_div}x{n_div}, z={z_range})")
+    return occ, box, n_div, z_range
+
+
+# --------------------------------------------------------------------------- #
+# Detección: cámara (verde) + LiDAR (celda)
+# --------------------------------------------------------------------------- #
+def _sees_green(video):
+    """True si la cámara frontal ve un blob verde suficientemente grande."""
+    code, data = video.GetImageSample()
+    if code != 0 or not data:
+        return False
+    arr = np.frombuffer(bytes(data), dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return False
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, GREEN_LO, GREEN_HI)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return False
+    return max(cv2.contourArea(c) for c in cnts) >= GREEN_MIN_AREA
+
+
+def make_detector(lidar, video, baseline_occupied, box, n_div, z_range,
+                  search, cloud_lock, hit_threshold=HIT_THRESHOLD):
+    """
+    Devuelve check_ball() -> (fila, col) | None.
+
+    Cámara + LiDAR: solo si la cámara ve verde, mira en el LiDAR qué celda
+    —libre en el mapa base— está ahora ocupada. Esa es la pelota.
+    """
+    z_min, z_max = z_range
+
+    def check_ball():
+        if not _sees_green(video):
+            return None
+
+        with cloud_lock:
+            data = lidar.get_cloud()
+        if data is None or len(data["xyz"]) == 0:
+            return None
+
+        xyz = data["xyz"].astype(np.float64, copy=False)
+        current = constructCellMap(xyz, box, n_div, z_min=z_min, z_max=z_max)
+
+        # Celdas nuevas: ahora ocupadas pero libres en el mapa base.
+        new_occ = (current > hit_threshold) & (~baseline_occupied)
+        if not new_occ.any():
+            return None
+
+        cand = np.where(new_occ, current, -1)
+        r, c = np.unravel_index(int(np.argmax(cand)), cand.shape)
+        search.ball_cell = (int(r), int(c))
+        search.ball_count = int(current[r, c])
+        print(f"[DET] Verde confirmado + celda nueva ocupada {(int(r), int(c))} "
+              f"({int(current[r, c])} pts)")
+        return (int(r), int(c))
+
+    return check_ball
+
+
+# --------------------------------------------------------------------------- #
+# Visualización
+# --------------------------------------------------------------------------- #
+def _cell_quad(box, n_div, r, c, z=0.05, color=(0.1, 0.9, 0.1)):
+    """Cuadrado relleno (TriangleMesh) sobre la celda (fila r, col c)."""
+    v = np.asarray(box, dtype=float)
+    v0, e_s, e_t = v[0], v[1] - v[0], v[3] - v[0]
+    s0, s1 = c / n_div, (c + 1) / n_div
+    t0, t1 = r / n_div, (r + 1) / n_div
+
+    def P(s, t):
+        xy = v0 + e_s * s + e_t * t
+        return [xy[0], xy[1], z]
+
+    verts = np.array([P(s0, t0), P(s1, t0), P(s1, t1), P(s0, t1)], dtype=float)
+    tris = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    m = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(verts), o3d.utility.Vector3iVector(tris)
+    )
+    m.paint_uniform_color(list(color))
+    m.compute_vertex_normals()
+    return m
+
+
+def visualize(odom, lidar, search, box, n_div, baseline_occupied, cloud_lock):
+    vis = o3d.visualization.VisualizerWithKeyCallback()
+    vis.create_window(window_name="Go2 - Buscar pelota", width=1280, height=720)
+
+    opt = vis.get_render_option()
+    opt.point_size = 2.5
+    opt.background_color = np.array([0.04, 0.04, 0.07])
+    opt.light_on = True
+
+    world_axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
+    vis.add_geometry(world_axis)
+    robot_axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3)
+    vis.add_geometry(robot_axis)
+
+    # Malla de la rejilla (n_div celdas por lado -> n_lado = n_div - 1).
+    grid = square_subdivision(box, n_lado=n_div - 1)
+    malla = grid_lineset(grid, z=0.05, color=(0.5, 0.5, 0.5))
+    vis.add_geometry(malla)
+
+    # Celdas ocupadas del mapa base (rojo tenue).
+    for (r, c) in zip(*np.where(baseline_occupied)):
+        vis.add_geometry(_cell_quad(box, n_div, r, c, z=0.02, color=(0.5, 0.15, 0.15)))
+
+    pcd = o3d.geometry.PointCloud()
+    accumulated = o3d.geometry.PointCloud()
+    prev_T = np.eye(4)
+    points_added = False
+    ball_added = False
+    frames = 0
+
+    def paint_ball():
+        nonlocal ball_added
+        if search.ball_cell is not None and not ball_added:
+            r, c = search.ball_cell
+            vis.add_geometry(_cell_quad(box, n_div, r, c, z=0.08, color=(0.1, 0.9, 0.1)),
+                             reset_bounding_box=False)
+            ball_added = True
+            print(f"[VIZ] Pelota pintada en la celda (fila={r}, col={c})")
+
+    while not search.end:
+        if odom.update():
+            T = odom.T
+            robot_axis.transform(T @ np.linalg.inv(prev_T))
+            prev_T = T
+            vis.update_geometry(robot_axis)
+
+        with cloud_lock:
+            data = lidar.get_cloud()
+        if data is not None and len(data["xyz"]) > 0 and odom.has_pose:
+            xyz = data["xyz"].astype(np.float64, copy=False)
+            frame_pcd = o3d.geometry.PointCloud()
+            frame_pcd.points = o3d.utility.Vector3dVector(xyz)
+            frame_pcd.colors = o3d.utility.Vector3dVector(colorize_by_z(xyz))
+            accumulated += frame_pcd
+            frames += 1
+            if frames >= DOWNSAMPLE_EVERY:
+                accumulated = accumulated.voxel_down_sample(VOXEL_SIZE)
+                frames = 0
+            pcd.points = accumulated.points
+            pcd.colors = accumulated.colors
+            if not points_added:
+                vis.add_geometry(pcd, reset_bounding_box=True)
+                points_added = True
+            else:
+                vis.update_geometry(pcd)
+
+        paint_ball()
+
+        if not vis.poll_events():
+            break
+        vis.update_renderer()
+        if data is None:
+            time.sleep(0.01)
+
+    # Búsqueda terminada: asegurar que la pelota queda pintada y mantener ventana.
+    paint_ball()
+    while True:
+        if not vis.poll_events():
+            break
+        vis.update_renderer()
+        time.sleep(0.02)
+    vis.destroy_window()
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def main():
+    args = [a for a in sys.argv[1:]]
+    net_iface = None
+    map_path = None
+    for a in args:
+        if a.endswith(".npz"):
+            map_path = a
+        else:
+            net_iface = a
+
+    if net_iface is not None:
+        ChannelFactoryInitialize(0, net_iface)
+    else:
+        ChannelFactoryInitialize(0)
+
+    occ, box, n_div, z_range = load_baseline(map_path)
+    baseline_occupied = occ > HIT_THRESHOLD
+
+    lidar = Custom(TOPIC_CLOUD)
+    odom = OdomTracker()
+
+    client = SportClient()
+    client.SetTimeout(5.0)
+    client.Init()
+
+    video = VideoClient()
+    video.SetTimeout(3.0)
+    video.Init()
+
+    search = Search()
+    cloud_lock = threading.Lock()
+
+    check_ball = make_detector(lidar, video, baseline_occupied, box, n_div,
+                               z_range, search, cloud_lock,
+                               hit_threshold=HIT_THRESHOLD)
+
+    def run_search():
+        try:
+            search.result = autonomous_movement(
+                client, odom, occ, box, n_div, check_ball,
+                hit_threshold=HIT_THRESHOLD,
+            )
+        finally:
+            search.end = True
+
+    nav_thread = threading.Thread(target=run_search, daemon=True)
+    nav_thread.start()
+
+    visualize(odom, lidar, search, box, n_div, baseline_occupied, cloud_lock)
+
+    if search.ball_cell is not None:
+        r, c = search.ball_cell
+        print(f"\n>>> PELOTA ENCONTRADA en la celda fila={r}, col={c} "
+              f"({search.ball_count} puntos LiDAR)")
+    else:
+        print("\n>>> No se detectó la pelota durante el recorrido")
+
+
+if __name__ == "__main__":
+    print("WARNING: asegúrate de que no hay obstáculos alrededor del robot.")
+    input("Pulsa Enter para continuar...")
+    main()
