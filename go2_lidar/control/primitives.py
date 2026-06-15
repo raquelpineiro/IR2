@@ -1,3 +1,10 @@
+"""Primitivas de control de locomoción del Go2.
+
+Bucles de control de bajo nivel que mandan comandos `client.Move(vx, vy, vyaw)`
+en lazo cerrado contra la odometría: pivotar a un rumbo, caminar hasta un punto
+con correcciones de rumbo, y combinaciones de ambos. Incluyen el manejo de la
+"banda muerta" del gait (el Go2 ignora velocidades muy pequeñas)."""
+
 import math
 import time
 from go2_lidar.transforms import _robot_to_world, get_yaw_from_rot, _wrap_pi
@@ -9,6 +16,8 @@ def _apply_vyaw_deadband(vyaw, yaw_error, yaw_tolerance, min_useful=0.5):
     Si pedimos un vyaw insuficiente pero seguimos fuera de tolerancia,
     forzar un mínimo útil que sí mueva las patas.
     """
+    # Si aún no estamos en tolerancia pero la vyaw pedida es demasiado pequeña
+    # para mover al robot, forzar el mínimo útil con el signo del error.
     if abs(yaw_error) > yaw_tolerance and abs(vyaw) < min_useful:
         return math.copysign(min_useful, yaw_error)
     return vyaw
@@ -25,22 +34,26 @@ def _pivot_to_heading(target_yaw_world, client, odom,
     rotación residual del gait — sin esto, el robot sigue girando 50-200 ms
     a la última vyaw comandada (= overshoot importante con la banda muerta).
     """
-    Kp_w = 1.5
-    max_w = 0.8
+    Kp_w = 1.5          # ganancia proporcional de la velocidad angular
+    max_w = 0.8         # tope de velocidad angular (rad/s)
     last_log = 0.0
 
     while True:
+        # 1) Error de yaw normalizado a (-pi, pi].
         curr_yaw = get_yaw_from_rot(odom.R)
         yaw_error = _wrap_pi(target_yaw_world - curr_yaw)
 
+        # 2) Dentro de tolerancia: frenar en seco y salir.
         if abs(yaw_error) < yaw_tolerance:
             client.Move(0.0, 0.0, 0.0)
             return
 
+        # 3) Control P saturado + corrección de banda muerta, y comandar giro.
         vyaw = max(-max_w, min(max_w, Kp_w * yaw_error))
         vyaw = _apply_vyaw_deadband(vyaw, yaw_error, yaw_tolerance)
         client.Move(0.0, 0.0, vyaw)
 
+        # 4) Log cada 0.5 s para no saturar la consola.
         now = time.time()
         if now - last_log > 0.5:
             print(f"  [{tag}] yaw_obj={math.degrees(target_yaw_world):+6.1f}°  "
@@ -59,14 +72,17 @@ def _pivot_to_face(target_x, target_y, client, odom,
     Útil para correcciones finas; en esquinas usa _pivot_to_heading.
     """
     while True:
+        # Vector hacia el objetivo desde la posición actual.
         curr_x = odom.t[0]
         curr_y = odom.t[1]
         dx = target_x - curr_x
         dy = target_y - curr_y
 
+        # Si ya estamos prácticamente encima, no hay rumbo que encarar.
         if math.hypot(dx, dy) < 1e-3:
             return
 
+        # Rumbo hacia el objetivo y pivote a ese yaw.
         target_yaw = math.atan2(dy, dx)
         _pivot_to_heading(target_yaw, client, odom,
                           yaw_tolerance=yaw_tolerance, tag="pivot")
@@ -86,15 +102,16 @@ def _walk_to(target_x, target_y, client, odom, tolerance=0.1, min_v=0.0):
     fuera de tolerancia (útil para tolerancias finas de centrado). Por defecto
     0 -> comportamiento original.
     """
-    Kp_v = 0.6
-    Kp_w = 1.0
-    max_v = 0.4
+    Kp_v = 0.6          # ganancia P de velocidad lineal
+    Kp_w = 1.0          # ganancia P de velocidad angular (corrección de rumbo)
+    max_v = 0.4         # tope de velocidad lineal (m/s)
     max_w = 0.4                       # más suave: solo correcciones finas
-    yaw_redo_threshold = math.radians(20.0)
+    yaw_redo_threshold = math.radians(20.0)   # si el rumbo se desvía más, re-pivotar
 
     last_log = 0.0
 
     while True:
+        # 1) Estado actual y vector al objetivo.
         curr_x = odom.t[0]
         curr_y = odom.t[1]
         curr_yaw = get_yaw_from_rot(odom.R)
@@ -103,10 +120,12 @@ def _walk_to(target_x, target_y, client, odom, tolerance=0.1, min_v=0.0):
         dy = target_y - curr_y
         distance = math.hypot(dx, dy)
 
+        # 2) ¿Llegamos? (dentro de tolerancia) -> parar.
         if distance < tolerance:
             print(f"[NAV] ¡Destino ({target_x:+.2f}, {target_y:+.2f}) alcanzado!")
             return
 
+        # 3) Error de rumbo hacia el objetivo (normalizado).
         target_yaw = math.atan2(dy, dx)
         yaw_error = math.atan2(math.sin(target_yaw - curr_yaw),
                                math.cos(target_yaw - curr_yaw))
@@ -116,12 +135,15 @@ def _walk_to(target_x, target_y, client, odom, tolerance=0.1, min_v=0.0):
             print(f"ESTOY ENTRANDO")
             return _pivot_then_walk(target_x, target_y, client, odom, tolerance, min_v)
 
+        # 4) Velocidades: avance proporcional a la distancia (con min_v contra la
+        #    banda muerta) y corrección angular proporcional al error de rumbo.
         vx = max(-max_v, min(max_v, Kp_v * distance))
         if min_v and vx < min_v:          # banda muerta: garantizar avance real
             vx = min_v
         vyaw = max(-max_w, min(max_w, Kp_w * yaw_error))
         client.Move(vx, 0.0, vyaw)
 
+        # 5) Log cada 0.5 s.
         now = time.time()
         if now - last_log > 0.5:
             print(f"  [walk]  dist={distance:.3f} m  "
@@ -133,6 +155,8 @@ def _walk_to(target_x, target_y, client, odom, tolerance=0.1, min_v=0.0):
 
 
 def _pivot_then_walk(target_x, target_y, client, odom, tolerance, min_v=0.0):
+    """Primero pivota para encarar el objetivo y luego camina hasta él. Se usa
+    como recuperación cuando _walk_to detecta demasiada desviación de rumbo."""
     _pivot_to_face(target_x, target_y, client, odom)
     _walk_to(target_x, target_y, client, odom, tolerance=tolerance, min_v=min_v)
 
@@ -153,6 +177,8 @@ def go_to_waypoint(target_x_rel, target_y_rel, client, odom, tolerance=0.1):
     Navega hacia una coordenada (X, Y) expresada en el frame del robot
     en el instante de arranque: +X hacia delante, +Y hacia la izquierda.
     """
+    # Esperar pose y fijar el frame de arranque, luego pasar el objetivo
+    # relativo a coordenadas del mundo y navegar hasta él.
     odom._wait_for_pose()
     x0, y0, yaw0 = odom._initial_frame()
     target_x, target_y = _robot_to_world(target_x_rel, target_y_rel, x0, y0, yaw0)
@@ -178,6 +204,7 @@ def _pivot_to_heading_precise(target_yaw_world, client, odom, tag="corner",
     Mata el overshoot del deadband: lo que el primer pivote pasa de largo,
     los siguientes lo recortan con menos velocidad (más fino el control P).
     """
+    # Pasada por cada tolerancia, de la más gruesa a la más fina.
     for i, tol in enumerate(tolerances):
         curr_yaw = get_yaw_from_rot(odom.R)
         err = _wrap_pi(target_yaw_world - curr_yaw)
@@ -189,14 +216,17 @@ def _pivot_to_heading_precise(target_yaw_world, client, odom, tag="corner",
         print(f"  [{tag}] paso {i + 1}/{len(tolerances)}  "
               f"tol={math.degrees(tol):.1f}°  err_inicial={math.degrees(err):+5.2f}°")
 
+        # Pivotar a esta tolerancia.
         _pivot_to_heading(target_yaw_world, client, odom,
                           yaw_tolerance=tol, tag=f"{tag}#{i + 1}")
 
+        # Dejar que el gait se asiente antes de re-medir (mata overshoot).
         settle_end = time.time() + settle_s
         while time.time() < settle_end:
             client.Move(0.0, 0.0, 0.0)
             time.sleep(0.05)
 
+    # Log final con el error residual tras todas las pasadas.
     curr_yaw = get_yaw_from_rot(odom.R)
     err = _wrap_pi(target_yaw_world - curr_yaw)
     print(f"  [{tag}] final  obj={math.degrees(target_yaw_world):+6.1f}°  "
