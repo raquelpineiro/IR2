@@ -51,7 +51,7 @@ HIT_THRESHOLD = 20            # conteo de puntos por celda para considerarla ocu
 BALL_Z_RANGE = (0.03, 0.35)
 GREEN_LO = np.array([35, 70, 50], dtype=np.uint8)    # verde en HSV (OpenCV: H 0-179)
 GREEN_HI = np.array([85, 255, 255], dtype=np.uint8)
-GREEN_MIN_AREA = 500         # área mínima (px) del blob verde para darlo por válido
+GREEN_MIN_AREA = 50000         # área mínima (px) del blob verde para darlo por válido
 
 VOXEL_SIZE = 0.04            # tamaño de voxel para reducir la nube en el visor
 DOWNSAMPLE_EVERY = 10        # cada cuántos frames voxelizar la nube acumulada
